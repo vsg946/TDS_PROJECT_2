@@ -15,25 +15,29 @@ class QuizSolver:
         self.secret = secret
 
     # -----------------------------
-    # Utility Functions
+    # Utility
     # -----------------------------
 
     def _debug(self, *args):
         print("[DEBUG]", *args)
 
     def _find_submit_url(self, html_text: str):
-        m = re.search(r"https?://[^\"]+/submit[^\"]*", html_text)
-        if m:
-            return m.group(0)
-        m2 = re.search(r"https?://[^\"]*(?:submit)[^\s'\"<>]*", html_text)
-        return m2.group(0) if m2 else None
+        """
+        Extract a clean submit URL without trailing HTML tags.
+        """
+        pattern = r"https?://[a-zA-Z0-9\.\-_/]+/submit"
+        match = re.search(pattern, html_text)
+        return match.group(0) if match else None
 
     def _extract_atob(self, html_text: str):
-        """Find atob(`...`), atob("..."), atob('...') content."""
+        """
+        Extract atob(`...`) / atob("...") / atob('...') contents.
+        """
         chunks = []
         for m in re.finditer(
             r'atob\(\s*`([^`]*)`\s*\)|atob\(\s*"([^"]*)"\s*\)|atob\(\s*\'([^\']*)\'\s*\)',
-            html_text
+            html_text,
+            re.DOTALL
         ):
             payload = next((g for g in m.groups() if g), None)
             if payload:
@@ -47,16 +51,13 @@ class QuizSolver:
             return None
 
     def _download_file(self, href):
-        """Download file if URL is absolute."""
         if not href.lower().startswith("http"):
             return None
-        
         try:
             r = requests.get(href, timeout=30)
-        except Exception:
-            return None
-        
-        if r.status_code != 200:
+            if r.status_code != 200:
+                return None
+        except:
             return None
 
         tmp = tempfile.NamedTemporaryFile(delete=False)
@@ -69,7 +70,6 @@ class QuizSolver:
     # -----------------------------
 
     def _sum_value_in_pdf_page2(self, pdf_path):
-        """Look for table in page 2 and sum the 'value' column."""
         self._debug("Extracting PDF:", pdf_path)
         try:
             with pdfplumber.open(pdf_path) as pdf:
@@ -88,10 +88,9 @@ class QuizSolver:
                             total = float(series.sum())
                             self._debug("PDF sum:", total)
                             return total
-
         except Exception as e:
             self._debug("PDF error:", e)
-        
+
         return None
 
     def _process_csv_xlsx(self, file_path):
@@ -100,43 +99,40 @@ class QuizSolver:
                 df = pd.read_csv(file_path)
             else:
                 df = pd.read_excel(file_path)
-            
+
             for col in df.columns:
                 if col.lower() == "value":
                     return float(pd.to_numeric(df[col], errors="coerce").sum())
         except Exception as e:
             self._debug("Spreadsheet parse error:", e)
-        
+
         return None
 
     # -----------------------------
-    # Main Solver Logic
+    # Solve one page
     # -----------------------------
 
     def _solve_one_page(self, page, url, time_left):
-        """Solve a *single* quiz page and return:
-           (answer, submit_url, next_url, full_submit_response)
-        """
 
         self._debug("Visiting:", url)
-        page.goto(url, timeout=120000)
-        html = page.content()
 
+        # WAIT for JS-rendering
+        page.goto(url, wait_until="networkidle", timeout=120000)
+
+        html = page.content()
         submit_url = self._find_submit_url(html)
         self._debug("Submit URL:", submit_url)
 
-        # ----------- Extract atob content ------------
+        # Extract base64 atob() blocks
         decoded_text_chunks = []
         for raw in self._extract_atob(html):
             decoded = self._decode_base64(raw)
             if decoded:
                 decoded_text_chunks.append(decoded)
 
-        # ----------- Find link to file ---------------
+        # Detect downloadable file
         file_path = None
-        anchor_tags = page.query_selector_all("a")
-
-        for a in anchor_tags:
+        for a in page.query_selector_all("a"):
             href = a.get_attribute("href") or ""
             if any(href.lower().endswith(ext) for ext in [".pdf", ".csv", ".xlsx", ".json"]):
                 fp = self._download_file(href)
@@ -145,10 +141,10 @@ class QuizSolver:
                     file_path = fp
                     break
 
-        # ----------- Determine the answer -------------
+        # Determine the answer
         answer = None
 
-        # 1) If decoded JSON contains "answer"
+        # 1) JSON inside atob
         for txt in decoded_text_chunks:
             try:
                 j = json.loads(txt)
@@ -158,28 +154,31 @@ class QuizSolver:
             except:
                 pass
 
-        # 2) If PDF detected
+        # 2) If PDF
         if answer is None and file_path and file_path.endswith(".pdf"):
             ans = self._sum_value_in_pdf_page2(file_path)
             if ans is not None:
                 answer = ans
 
-        # 3) If CSV/XLSX detected
+        # 3) If CSV/XLSX
         if answer is None and file_path and file_path.endswith((".csv", ".xlsx")):
             ans = self._process_csv_xlsx(file_path)
             if ans is not None:
                 answer = ans
 
-        # 4) Fallback: take last number on page
+        # 4) Fallback: last number on the page
         if answer is None:
             nums = re.findall(r"[-+]?\d*\.\d+|\d+", html)
             if nums:
                 val = nums[-1]
-                answer = float(val) if "." in val else int(val)
+                try:
+                    answer = float(val) if "." in val else int(val)
+                except:
+                    answer = val
 
-        self._debug("ANSWER FOUND:", answer)
+        self._debug("ANSWER:", answer)
 
-        # ----------- Submit the answer ----------------
+        # Submit answer
         submit_resp_obj = None
 
         if submit_url:
@@ -201,9 +200,7 @@ class QuizSolver:
 
         self._debug("SUBMIT RESPONSE:", submit_resp_obj)
 
-        next_url = None
-        if isinstance(submit_resp_obj, dict):
-            next_url = submit_resp_obj.get("url")
+        next_url = submit_resp_obj.get("url") if isinstance(submit_resp_obj, dict) else None
 
         return answer, submit_url, next_url, submit_resp_obj
 
@@ -212,28 +209,26 @@ class QuizSolver:
     # -----------------------------
 
     def solve_and_submit(self, url, time_budget_sec=170):
+
         start = time.time()
 
         result = {
-            "submissions": [],
-            "first": None
+            "first": None,
+            "submissions": []
         }
 
         with sync_playwright() as p:
 
-            # Retry browser launch (Windows often fails)
+            # Stable Chromium launch
             for attempt in range(3):
                 try:
                     browser = p.chromium.launch(headless=True)
                     break
-                except Exception as e:
-                    if attempt == 2:
-                        raise
+                except:
                     time.sleep(2)
-
             page = browser.new_page()
 
-            # Solve first page
+            # First page
             answer, submit_url, next_url, resp = self._solve_one_page(
                 page, url, time_budget_sec
             )
@@ -244,7 +239,7 @@ class QuizSolver:
                 "submit_response": resp
             }
 
-            # Solve chain
+            # Quiz chain
             while next_url and (time.time() - start < time_budget_sec):
                 ans, s_url, n_url, r = self._solve_one_page(
                     page, next_url, time_budget_sec
