@@ -649,3 +649,4 @@ class QuizSolver:
             result["total_time"] = time.time() - start
 
         return result
+
