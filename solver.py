@@ -4,459 +4,590 @@ import time
 import json
 import base64
 import tempfile
+import hashlib
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
 import pandas as pd
 import pdfplumber
-from urllib.parse import urlparse, urljoin
-from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
-import hashlib
-import speech_recognition as sr
-from pydub import AudioSegment
+from urllib.parse import urlparse, urljoin
+from playwright.sync_api import sync_playwright, Page
+
+# AI Pipe token – set this as an env var in Railway
+AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
+
 
 class QuizSolver:
     def __init__(self, email: str, secret: str):
         self.email = email
         self.secret = secret
-        self.visited_urls = set()
         self.session = requests.Session()
+        self.visited = set()
 
     def _debug(self, *args):
-        print("[DEBUG]", *args)
+        print("[DEBUG]", *args, flush=True)
 
-    # ------------------------------------------------------------
-    # Utility functions
-    # ------------------------------------------------------------
-
-    def _find_submit_url(self, html, base_url):
-        """Extract /submit endpoint from page."""
+    # -----------------------------------------------------
+    # HTML / URL helpers
+    # -----------------------------------------------------
+    def _find_submit_url(self, html: str, page_url: str) -> Optional[str]:
+        """Find the /submit URL."""
         m = re.search(r"https?://[^\s\"'<>]+/submit", html)
         if m:
             return m.group(0)
-
         if "/submit" in html:
-            u = urlparse(base_url)
-            return f"{u.scheme}://{u.netloc}/submit"
-
+            p = urlparse(page_url)
+            return f"{p.scheme}://{p.netloc}/submit"
         return None
 
-    def _decode_base64(self, s):
+    def _decode_base64(self, s: str) -> Optional[str]:
         try:
             s = s.replace("-", "+").replace("_", "/")
             pad = len(s) % 4
             if pad:
                 s += "=" * (4 - pad)
-            return base64.b64decode(s).decode("utf-8", errors="ignore")
-        except:
+            return base64.b64decode(s).decode("utf-8", "ignore")
+        except Exception:
             return None
 
-    def _extract_encoded_chunks(self, html):
+    def _extract_atob_chunks(self, html: str) -> List[str]:
+        """Find atob("...") payloads and decode them."""
         chunks = []
-
-        for m in re.finditer(r'atob\(["\']([^"\']+)["\']\)', html):
-            d = self._decode_base64(m.group(1))
-            if d:
-                chunks.append(d)
-                if len(chunks) >= 5:
-                    break
-
+        pattern = r'atob\(\s*[`"\']([^`"\']+)[`"\']\s*\)'
+        for m in re.finditer(pattern, html):
+            dec = self._decode_base64(m.group(1))
+            if dec:
+                chunks.append(dec)
+            if len(chunks) >= 5:
+                break
         return chunks
 
-    def _download_file(self, href, page_url):
+    # -----------------------------------------------------
+    # File download + processing
+    # -----------------------------------------------------
+    def _download_file(self, href: str, base_url: str) -> Optional[Tuple[str, bytes, str]]:
+        """Download a file and return (path, bytes, type)."""
         if not href:
             return None
+        if not href.lower().startswith("http"):
+            href = urljoin(base_url, href)
 
-        if not href.startswith("http"):
-            href = urljoin(page_url, href)
-
+        self._debug("Downloading file:", href)
         try:
-            r = self.session.get(href, timeout=12, stream=True)
+            r = self.session.get(href, timeout=25)
             if r.status_code != 200:
+                self._debug("Download status", r.status_code)
                 return None
-
-            content = b""
-            for chunk in r.iter_content(8192):
-                content += chunk
-                if len(content) > 12 * 1024 * 1024:
-                    return None
-
-        except:
+            content = r.content
+        except Exception as e:
+            self._debug("Download error:", e)
             return None
 
-        ext = ""
         ct = r.headers.get("content-type", "").lower()
+        ext = ""
+        ftype = "other"
 
-        if "pdf" in ct or href.endswith(".pdf"):
+        if "pdf" in ct or href.lower().endswith(".pdf"):
             ext = ".pdf"
-        elif "csv" in ct or href.endswith(".csv"):
+            ftype = "pdf"
+        elif "csv" in ct or href.lower().endswith(".csv"):
             ext = ".csv"
-        elif "xlsx" in ct or href.endswith(".xlsx"):
+            ftype = "csv"
+        elif "excel" in ct or href.lower().endswith(".xlsx"):
             ext = ".xlsx"
-        elif "json" in ct or href.endswith(".json"):
+            ftype = "xlsx"
+        elif "json" in ct or href.lower().endswith(".json"):
             ext = ".json"
-        elif any(href.endswith(e) for e in [".mp3", ".wav", ".ogg", ".m4a", ".flac"]):
-            ext = os.path.splitext(href)[1]
-
-        if ext == "":
-            return None
+            ftype = "json"
+        elif any(href.lower().endswith(x) for x in [".mp3", ".wav", ".ogg", ".m4a", ".flac"]):
+            ext = "." + href.split(".")[-1].split("?")[0]
+            ftype = "audio"
+        else:
+            # unknown – still save with whatever extension is there
+            name = href.split("/")[-1]
+            if "." in name:
+                ext = "." + name.split(".")[-1].split("?")[0]
 
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
         tmp.write(content)
         tmp.close()
-        return tmp.name
+        return tmp.name, content, ftype
 
-    # ------------------------------------------------------------
-    # FILE PROCESSING
-    # ------------------------------------------------------------
-
-    def _process_pdf(self, path):
+    def _process_pdf_sum(self, path: str) -> Optional[float]:
+        """Sum 'value'-like column in PDF tables."""
+        self._debug("Processing PDF:", path)
         try:
             with pdfplumber.open(path) as pdf:
-                total = 0
+                total = 0.0
                 found = False
-                pages = min(len(pdf.pages), 10)
-
-                for i in range(pages):
-                    tbls = pdf.pages[i].extract_tables()
-                    if not tbls:
+                for page in pdf.pages[:10]:
+                    tables = page.extract_tables()
+                    if not tables:
                         continue
-                    for t in tbls:
-                        if len(t) < 2: 
+                    for t in tables:
+                        if not t or len(t) < 2:
                             continue
-                        header = [h.lower().strip() if h else "" for h in t[0]]
+                        header = [str(h).strip().lower() if h else "" for h in t[0]]
                         idx = -1
-                        for j,h in enumerate(header):
-                            if h in ["value", "amount", "total", "sum"]:
-                                idx = j
+                        for i, h in enumerate(header):
+                            if h in ("value", "amount", "total", "sum"):
+                                idx = i
                                 break
-                        if idx == -1: 
+                        if idx == -1:
                             continue
                         for row in t[1:]:
                             try:
                                 total += float(row[idx])
                                 found = True
-                            except:
+                            except Exception:
                                 pass
                 if found:
                     return total
-        except:
-            pass
+        except Exception as e:
+            self._debug("PDF error:", e)
         return None
 
-    def _process_csv_xlsx(self, path):
+    def _process_csv_xlsx_sum(self, path: str) -> Optional[float]:
+        """Sum value-like column in CSV/XLSX."""
+        self._debug("Processing CSV/XLSX:", path)
         try:
             if path.endswith(".csv"):
-                df = pd.read_csv(path)
+                df = pd.read_csv(path, nrows=20000)
             else:
-                df = pd.read_excel(path)
+                df = pd.read_excel(path, nrows=20000)
 
             cols = [c.lower().strip() for c in df.columns]
-            for pref in ["value", "amount", "total", "sum"]:
-                if pref in cols:
-                    idx = cols.index(pref)
-                    return float(pd.to_numeric(df.iloc[:, idx], errors="coerce").sum())
+            for key in ("value", "amount", "total", "sum"):
+                if key in cols:
+                    idx = cols.index(key)
+                    s = pd.to_numeric(df.iloc[:, idx], errors="coerce").sum()
+                    return float(s)
 
-            nums = df.select_dtypes("number")
-            if len(nums.columns):
+            nums = df.select_dtypes(include=["number"])
+            if not nums.empty:
                 return float(nums.sum().sum())
-        except:
-            return None
-        return None
-
-    def _process_json(self, path):
-        try:
-            d = json.load(open(path))
-            if isinstance(d, dict):
-                if "answer" in d:
-                    return d["answer"]
-                if "values" in d and isinstance(d["values"], list):
-                    return sum(d["values"])
-                return sum(v for v in d.values() if isinstance(v,(int,float)))
-        except:
-            pass
-        return None
-
-    # ------------------------------------------------------------
-    # AUDIO PROCESSING
-    # ------------------------------------------------------------
-
-    def _transcribe_audio(self, path):
-        """Google Speech API free tier (local)."""
-        try:
-            audio = path
-            if not path.endswith(".wav"):
-                seg = AudioSegment.from_file(path)
-                audio = path.replace(os.path.splitext(path)[1], ".wav")
-                seg.export(audio, format="wav")
-
-            rec = sr.Recognizer()
-            with sr.AudioFile(audio) as src:
-                data = rec.record(src)
-                return rec.recognize_google(data)
         except Exception as e:
-            self._debug("Audio error", e)
+            self._debug("CSV/XLSX error:", e)
+        return None
+
+    def _process_json_answer(self, path: str) -> Optional[Any]:
+        """Extract answer from JSON if possible."""
+        self._debug("Processing JSON:", path)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                if "answer" in data:
+                    return data["answer"]
+                if "values" in data and isinstance(data["values"], list):
+                    return sum(v for v in data["values"] if isinstance(v, (int, float)))
+                return sum(v for v in data.values() if isinstance(v, (int, float)))
+        except Exception as e:
+            self._debug("JSON error:", e)
+        return None
+
+    # -----------------------------------------------------
+    # Audio via AI Pipe LLM
+    # -----------------------------------------------------
+    def _llm_transcribe_audio(self, audio_bytes: bytes, ext: str) -> Optional[str]:
+        """Send audio bytes to AIPipe + GPT-4.1-nano to get transcript."""
+        if not AIPIPE_TOKEN:
+            self._debug("No AIPIPE_TOKEN, skipping online transcription")
             return None
 
-    def _execute_audio_instructions(self, text, page, url):
-        if not text:
+        self._debug("Transcribing audio via AIPipe...")
+        b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        fmt = ext.lstrip(".") or "mp3"
+
+        url = "https://aipipe.org/openrouter/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {AIPIPE_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "openai/gpt-4.1-nano",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "You are an accurate transcription engine. "
+                                "Transcribe the following audio exactly. "
+                                "Return ONLY the transcript text, nothing else."
+                            ),
+                        },
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": b64, "format": fmt},
+                        },
+                    ],
+                }
+            ],
+        }
+
+        try:
+            r = self.session.post(url, headers=headers, json=payload, timeout=40)
+            data = r.json()
+            txt = data["choices"][0]["message"]["content"]
+            return txt.strip()
+        except Exception as e:
+            self._debug("AIPipe transcription error:", e)
             return None
 
+    def _parse_direct_number_from_text(self, text: str) -> Optional[float]:
+        """Pull a direct numeric answer from transcript, if stated."""
         low = text.lower()
+        patterns = [
+            r"(?:secret\s*code|code|cutoff|value|number)\s*(?:is|=|:)?\s*(\d+)",
+            r"(?:answer|final\s*answer)\s*(?:is|=|:)?\s*(\d+)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, low)
+            if m:
+                try:
+                    return float(m.group(1))
+                except Exception:
+                    pass
 
-        # detect type
-        if "csv" in low:
-            t="csv"
-        elif "excel" in low or "xlsx" in low:
-            t="xlsx"
-        elif "pdf" in low:
-            t="pdf"
-        elif "json" in low:
-            t="json"
-        else:
+        nums = re.findall(r"\d+\.?\d*", low)
+        if nums:
+            try:
+                return float(nums[-1])
+            except Exception:
+                pass
+        return None
+
+    def _execute_audio_instructions(
+        self, transcript: str, page: Page, url: str
+    ) -> Optional[float]:
+        """
+        When audio describes: 'download the CSV / Excel / PDF / JSON and
+        sum/average/...', follow those instructions.
+        """
+        if not transcript:
+            return None
+
+        t = transcript.lower()
+        self._debug("Audio transcript:", transcript)
+
+        # operation
+        op = "sum"
+        if any(k in t for k in ["average", "mean"]):
+            op = "avg"
+        elif any(k in t for k in ["max", "highest", "largest"]):
+            op = "max"
+        elif any(k in t for k in ["min", "lowest", "smallest"]):
+            op = "min"
+        elif any(k in t for k in ["count", "number of"]):
+            op = "count"
+
+        # file type
+        ftype = None
+        ext = None
+        if "csv" in t:
+            ftype, ext = "csv", ".csv"
+        elif any(k in t for k in ["excel", "xlsx", "spreadsheet"]):
+            ftype, ext = "xlsx", ".xlsx"
+        elif "pdf" in t:
+            ftype, ext = "pdf", ".pdf"
+        elif "json" in t:
+            ftype, ext = "json", ".json"
+
+        if not ext:
             return None
 
         html = page.content()
-        m = re.search(rf'href=["\']([^"\']+\.{t})["\']', html)
-        if not m:
+        soup = BeautifulSoup(html, "html.parser")
+
+        target_href = None
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.lower().endswith(ext):
+                target_href = href
+                break
+
+        if not target_href:
             return None
 
-        path = self._download_file(m.group(1), url)
-        if not path: return None
-
-        # detect operation
-        if any(k in low for k in ["sum","add","total"]):
-            op="sum"
-        elif any(k in low for k in ["average","mean"]):
-            op="avg"
-        elif any(k in low for k in ["max","highest"]):
-            op="max"
-        elif any(k in low for k in ["min","lowest"]):
-            op="min"
-        elif any(k in low for k in ["count","number of"]):
-            op="count"
-        else:
-            op="sum"
-
-        # load df
-        try:
-            if t=="csv":
-                df = pd.read_csv(path)
-            elif t=="xlsx":
-                df = pd.read_excel(path)
-            elif t=="pdf":
-                return self._process_pdf(path)
-            elif t=="json":
-                return self._process_json(path)
-        except:
+        dl = self._download_file(target_href, url)
+        if not dl:
             return None
+        path, _bytes, dtype = dl
 
-        nums = df.select_dtypes("number")
-        if not len(nums.columns):
-            return None
+        # Process the file according to dtype & op
+        if dtype in ("csv", "xlsx"):
+            try:
+                if dtype == "csv":
+                    df = pd.read_csv(path)
+                else:
+                    df = pd.read_excel(path)
+            except Exception as e:
+                self._debug("Audio CSV/XLSX read error:", e)
+                return None
 
-        col = nums.columns[0]
+            nums = df.select_dtypes(include=["number"])
+            if nums.empty:
+                return None
+            col = nums.columns[0]
+            series = nums[col].dropna()
 
-        if op=="sum":
-            return float(nums[col].sum())
-        if op=="avg":
-            return float(nums[col].mean())
-        if op=="max":
-            return float(nums[col].max())
-        if op=="min":
-            return float(nums[col].min())
-        if op=="count":
-            return int(nums[col].count())
+            if op == "sum":
+                return float(series.sum())
+            if op == "avg":
+                return float(series.mean())
+            if op == "max":
+                return float(series.max())
+            if op == "min":
+                return float(series.min())
+            if op == "count":
+                return float(series.count())
+
+        elif dtype == "pdf":
+            return self._process_pdf_sum(path)
+        elif dtype == "json":
+            val = self._process_json_answer(path)
+            if isinstance(val, (int, float)):
+                return float(val)
 
         return None
 
-    # ------------------------------------------------------------
-    # ANSWER EXTRACTION
-    # ------------------------------------------------------------
-
-    def _extract_answer_from_page(self, page, html):
+    # -----------------------------------------------------
+    # Answer from HTML directly
+    # -----------------------------------------------------
+    def _extract_answer_from_page(self, page: Page, html: str) -> Optional[Any]:
+        """Use JS variables / data-answer attributes / regex."""
         try:
-            ans = page.evaluate("""
+            ans = page.evaluate(
+                """
             () => {
                 if (window.answer !== undefined) return window.answer;
                 if (window.solution !== undefined) return window.solution;
                 if (window.result !== undefined) return window.result;
-
-                let el = document.querySelector("[data-answer], .answer, #answer");
+                const el = document.querySelector('[data-answer], .answer, #answer');
                 if (el) {
                     if (el.dataset.answer) return el.dataset.answer;
                     return el.textContent.trim();
                 }
                 return null;
             }
-            """)
+            """
+            )
             if ans is not None:
-                try: return float(ans)
-                except: return ans
-        except:
+                try:
+                    return float(ans)
+                except Exception:
+                    return ans
+        except Exception:
             pass
 
-        m = re.search(r'answer["\s:=]+(\d+\.?\d*)', html)
+        m = re.search(r'answer["\s:=]+(\d+\.?\d*)', html, re.IGNORECASE)
         if m:
-            return float(m.group(1))
+            try:
+                return float(m.group(1))
+            except Exception:
+                return m.group(1)
 
         return None
 
-    # ------------------------------------------------------------
-    # Solve a single page
-    # ------------------------------------------------------------
-
-    def _solve_one(self, page, url, budget):
-        if budget < 5:
-            return None,None,None,{"error":"timeout"}
+    # -----------------------------------------------------
+    # Solve ONE page
+    # -----------------------------------------------------
+    def _solve_one_page(
+        self, page: Page, url: str, time_left: float
+    ) -> Tuple[Any, Optional[str], Optional[str], Dict[str, Any]]:
+        if time_left < 5:
+            return None, None, None, {"error": "timeout"}
 
         h = hashlib.md5(url.encode()).hexdigest()
-        if h in self.visited_urls:
-            return None,None,None,{"error":"visited"}
+        if h in self.visited:
+            return None, None, None, {"error": "visited"}
+        self.visited.add(h)
 
-        self.visited_urls.add(h)
-        self._debug("Visiting:", url)
-
+        self._debug("=== Visiting ===", url)
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=25000)
-            page.wait_for_timeout(400)
-        except:
-            pass
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(600)
+        except Exception as e:
+            self._debug("Page load error:", e)
 
         html = page.content()
-        submit = self._find_submit_url(html, url)
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(separator="\n", strip=True)
 
-        # audio?
-        audio_path=None
-        am = re.search(r'href=["\']([^"\']+\.(?:mp3|wav|ogg|m4a|flac))["\']', html)
-        if am:
-            audio_path = self._download_file(am.group(1), url)
+        submit_url = self._find_submit_url(html, url)
+        atob_chunks = self._extract_atob_chunks(html)
 
-        # data file?
-        file_path=None
-        fm = re.search(r'href=["\']([^"\']+\.(?:pdf|csv|xlsx|json))["\']', html)
-        if fm:
-            file_path = self._download_file(fm.group(1), url)
+        # Detect audio + one main data file
+        audio_bytes = None
+        audio_ext = ".mp3"
+        data_file_path = None
+        data_file_type = None
 
-        # encoded chunks
-        chunks = self._extract_encoded_chunks(html)
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            lower = href.lower()
 
-        # ---- answer resolution order ----
-        answer=None
+            if (audio_bytes is None) and any(
+                lower.endswith(x) for x in (".mp3", ".wav", ".ogg", ".m4a", ".flac")
+            ):
+                dl = self._download_file(href, url)
+                if dl:
+                    path, content, ftype = dl
+                    if ftype == "audio":
+                        audio_bytes = content
+                        audio_ext = os.path.splitext(path)[1] or ".mp3"
 
-        # AUDIO
-        if not answer and audio_path:
-            text = self._transcribe_audio(audio_path)
-            answer = self._execute_audio_instructions(text, page, url)
+            if (data_file_path is None) and any(
+                lower.endswith(x) for x in (".pdf", ".csv", ".xlsx", ".json")
+            ):
+                dl = self._download_file(href, url)
+                if dl:
+                    data_file_path, _bytes, data_file_type = dl
 
-        # DIRECT PAGE
+        answer: Any = None
+
+        # 1) Audio-based instructions, if any
+        if audio_bytes is not None:
+            transcript = self._llm_transcribe_audio(audio_bytes, audio_ext)
+            if transcript:
+                num = self._parse_direct_number_from_text(transcript)
+                if num is not None:
+                    answer = num
+                else:
+                    answer = self._execute_audio_instructions(transcript, page, url)
+
+        # 2) Direct from page
         if answer is None:
             answer = self._extract_answer_from_page(page, html)
 
-        # DECODED JSON
+        # 3) atob JSON with answer
         if answer is None:
-            for c in chunks:
+            for chunk in atob_chunks:
                 try:
-                    j=json.loads(c)
-                    if "answer" in j:
+                    j = json.loads(chunk)
+                    if isinstance(j, dict) and "answer" in j:
                         answer = j["answer"]
                         break
-                except:
+                except Exception:
                     pass
 
-        # FILE
-        if answer is None and file_path:
-            if file_path.endswith(".pdf"):
-                answer = self._process_pdf(file_path)
-            elif file_path.endswith(".csv") or file_path.endswith(".xlsx"):
-                answer = self._process_csv_xlsx(file_path)
-            elif file_path.endswith(".json"):
-                answer = self._process_json(file_path)
+        # 4) Data file numeric
+        if answer is None and data_file_path and data_file_type:
+            if data_file_type == "pdf":
+                answer = self._process_pdf_sum(data_file_path)
+            elif data_file_type in ("csv", "xlsx"):
+                answer = self._process_csv_xlsx_sum(data_file_path)
+            elif data_file_type == "json":
+                answer = self._process_json_answer(data_file_path)
 
-        # FALLBACK numeric
+        # 5) fallback – last number in visible text
         if answer is None:
-            nums = re.findall(r'\d+\.?\d*', html)
+            nums = re.findall(r"\d+\.?\d*", text)
             if nums:
-                try: answer = float(nums[-1])
-                except: answer = nums[-1]
+                try:
+                    answer = float(nums[-1])
+                except Exception:
+                    answer = nums[-1]
 
-        # FINAL fallback
         if answer is None:
             answer = "default"
 
         self._debug("ANSWER:", answer)
 
-        # ------------------------------------------------------------
-        # SUBMIT
-        # ------------------------------------------------------------
+        # Submit the answer
+        submit_response: Dict[str, Any] = {"error": "no-submit-url"}
+        next_url: Optional[str] = None
 
-        resp_obj={"error":"no-submit"}
-        next_url=None
-
-        if submit:
-            payload={
+        if submit_url:
+            payload = {
                 "email": self.email,
                 "secret": self.secret,
                 "url": url,
-                "answer": answer
+                "answer": answer,
             }
+            self._debug("Submitting to:", submit_url, "payload:", payload)
             try:
-                r=self.session.post(submit,json=payload,timeout=12)
-                try: resp_obj = r.json()
-                except: resp_obj={"text":r.text}
-            except:
-                resp_obj={"error":"post-fail"}
+                r = self.session.post(submit_url, json=payload, timeout=25)
+                try:
+                    submit_response = r.json()
+                except Exception:
+                    submit_response = {"text": r.text}
+                if isinstance(submit_response, dict):
+                    next_url = submit_response.get("url")
+            except Exception as e:
+                submit_response = {"error": str(e)}
 
-            if isinstance(resp_obj,dict):
-                next_url = resp_obj.get("url")
+        return answer, submit_url, next_url, submit_response
 
-        return answer,submit,next_url,resp_obj
-
-    # ------------------------------------------------------------
-    # ORCHESTRATOR
-    # ------------------------------------------------------------
-
-    def solve_and_submit(self, url, time_budget_sec=170):
-
-        start=time.time()
-        result={"first":None,"submissions":[],"completed":False}
+    # -----------------------------------------------------
+    # Public orchestrator
+    # -----------------------------------------------------
+    def solve_and_submit(self, url: str, time_budget_sec: int = 170) -> Dict[str, Any]:
+        start = time.time()
+        result: Dict[str, Any] = {
+            "first": None,
+            "submissions": [],
+            "completed": False,
+        }
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage"]
-            )
-            page = browser.new_page()
-            page.set_default_timeout(25000)
+            try:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
+            except Exception as e:
+                return {"error": f"browser-launch-failed: {e}"}
 
-            # first
-            answer,sub,next_url,resp = self._solve_one(page,url,time_budget_sec)
-            result["first"]={
-                "url":url,
-                "submit_url":sub,
-                "answer":answer,
-                "submit_response":resp
+            page = browser.new_page()
+            page.set_default_timeout(30000)
+
+            # First quiz URL
+            elapsed = time.time() - start
+            ans, s_url, nxt, resp = self._solve_one_page(
+                page, url, time_budget_sec - elapsed
+            )
+            result["first"] = {
+                "url": url,
+                "submit_url": s_url,
+                "answer": ans,
+                "submit_response": resp,
             }
 
-            # chain
-            count=0
-            while next_url and count<50:
-                elapsed=time.time()-start
-                if elapsed>165:
+            # Follow chain of URLs
+            iterations = 0
+            while nxt and iterations < 40:
+                elapsed = time.time() - start
+                if elapsed > 165:
+                    self._debug("Global time limit reached")
                     break
-                count+=1
-                a,s,n,r=self._solve_one(page,next_url,time_budget_sec-elapsed)
-                if a is None:
+
+                iterations += 1
+                self._debug(f"--- Chain step {iterations}: {nxt} ---")
+                ans2, s_url2, nxt2, resp2 = self._solve_one_page(
+                    page, nxt, time_budget_sec - elapsed
+                )
+                if ans2 is None:
                     break
-                result["submissions"].append({
-                    "url":next_url,
-                    "answer":a,
-                    "submit_url":s,
-                    "submit_response":r
-                })
-                next_url=n
+                result["submissions"].append(
+                    {
+                        "url": nxt,
+                        "answer": ans2,
+                        "submit_url": s_url2,
+                        "submit_response": resp2,
+                    }
+                )
+                nxt = nxt2
 
             browser.close()
-            result["completed"] = next_url is None
-            result["total_time"]=time.time()-start
+            result["completed"] = nxt is None
+            result["total_time"] = time.time() - start
 
         return result
