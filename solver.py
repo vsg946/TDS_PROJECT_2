@@ -18,12 +18,13 @@ from playwright.sync_api import sync_playwright, Page
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
 
 
-class QuizSolver:
+class EnhancedQuizSolver:
     def __init__(self, email: str, secret: str):
         self.email = email
         self.secret = secret
         self.session = requests.Session()
         self.visited = set()
+        self.cache: Dict[str, Tuple[str, bytes, str]] = {}
 
     # ------------------------------------------------------------------
     # Utilities
@@ -32,16 +33,37 @@ class QuizSolver:
         print("[DEBUG]", *args, flush=True)
 
     def _find_submit_url(self, html: str, page_url: str) -> Optional[str]:
-        """Find /submit endpoint."""
-        m = re.search(r"https?://[^\s\"'<>]+/submit", html)
-        if m:
-            return m.group(0)
-        if "/submit" in html:
+        """Find /submit endpoint with multiple strategies."""
+        patterns = [
+            r"https?://[^\s\"'<>]+/submit",
+            r"[\"']([^\"']*submit[^\"']*)[\"']",
+            r"action=[\"']([^\"']*)[\"']",
+        ]
+
+        for pattern in patterns:
+            m = re.search(pattern, html, re.IGNORECASE)
+            if m:
+                url = m.group(1) if len(m.groups()) > 0 else m.group(0)
+                if url.startswith("http"):
+                    return url
+                return urljoin(page_url, url)
+
+        # Look in forms
+        soup = BeautifulSoup(html, "html.parser")
+        for form in soup.find_all("form"):
+            action = form.get("action", "")
+            if "submit" in action.lower():
+                return urljoin(page_url, action)
+
+        # Fallback
+        if "/submit" in html.lower():
             p = urlparse(page_url)
             return f"{p.scheme}://{p.netloc}/submit"
+
         return None
 
     def _decode_base64(self, s: str) -> Optional[str]:
+        """Decode base64 with URL-safe variant support."""
         try:
             s = s.replace("-", "+").replace("_", "/")
             pad = len(s) % 4
@@ -51,26 +73,104 @@ class QuizSolver:
         except Exception:
             return None
 
-    def _extract_atob_chunks(self, html: str) -> List[str]:
-        """Decode atob(...) strings (hidden text / JSON)."""
-        chunks = []
-        pattern = r'atob\(\s*[`"\']([^`"\']+)[`"\']\s*\)'
-        for m in re.finditer(pattern, html):
-            dec = self._decode_base64(m.group(1))
-            if dec:
-                chunks.append(dec)
-            if len(chunks) >= 10:
-                break
-        return chunks
+    def _extract_hidden_data(self, html: str, page: Page) -> Dict[str, Any]:
+        """Extract hidden data: atob, JSON, vars, hidden inputs, data-*, etc."""
+        hidden_data: Dict[str, Any] = {
+            "atob_decoded": [],
+            "json_objects": [],
+            "hidden_inputs": [],
+            "data_attributes": [],
+            "script_variables": [],
+            "comments": [],
+            "meta_tags": [],
+            "localStorage": {},
+            "cookies": {},
+        }
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # 1. Decode atob() calls
+        atob_pattern = r'atob\(\s*[`"\']([^`"\']+)[`"\']\s*\)'
+        for m in re.finditer(atob_pattern, html):
+            decoded = self._decode_base64(m.group(1))
+            if decoded:
+                hidden_data["atob_decoded"].append(decoded)
+
+        # 2. Extract JSON and vars from scripts
+        for script in soup.find_all("script"):
+            script_text = script.string or ""
+
+            # JSON-ish objects
+            json_pattern = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"
+            for match in re.finditer(json_pattern, script_text):
+                try:
+                    obj = json.loads(match.group(0))
+                    hidden_data["json_objects"].append(obj)
+                except Exception:
+                    pass
+
+            # var/let/const assignments
+            var_pattern = r"(?:var|let|const)\s+(\w+)\s*=\s*([^;]+);"
+            for match in re.finditer(var_pattern, script_text):
+                var_name = match.group(1)
+                var_value = match.group(2).strip()
+                hidden_data["script_variables"].append(
+                    {"name": var_name, "value": var_value}
+                )
+
+        # 3. Hidden inputs
+        for inp in soup.find_all("input", type="hidden"):
+            hidden_data["hidden_inputs"].append(
+                {"name": inp.get("name", ""), "value": inp.get("value", "")}
+            )
+
+        # 4. data-* attributes
+        for elem in soup.find_all(attrs=lambda x: x and any(k.startswith("data-") for k in x)):
+            data_attrs = {k: v for k, v in elem.attrs.items() if k.startswith("data-")}
+            if data_attrs:
+                hidden_data["data_attributes"].append(
+                    {"tag": elem.name, "attributes": data_attrs}
+                )
+
+        # 5. Meta tags
+        for meta in soup.find_all("meta"):
+            if meta.get("name") or meta.get("property"):
+                hidden_data["meta_tags"].append(
+                    {
+                        "name": meta.get("name") or meta.get("property"),
+                        "content": meta.get("content", ""),
+                    }
+                )
+
+        # 6. localStorage
+        try:
+            storage = page.evaluate("() => JSON.stringify(localStorage)")
+            hidden_data["localStorage"] = json.loads(storage)
+        except Exception:
+            pass
+
+        # 7. cookies
+        try:
+            cookies = page.context.cookies()
+            hidden_data["cookies"] = {c["name"]: c["value"] for c in cookies}
+        except Exception:
+            pass
+
+        return hidden_data
 
     # ------------------------------------------------------------------
-    # Download + file summarisation
+    # Download + File Summaries
     # ------------------------------------------------------------------
     def _download_file(self, href: str, base_url: str) -> Optional[Tuple[str, bytes, str]]:
         if not href:
             return None
         if not href.lower().startswith("http"):
             href = urljoin(base_url, href)
+
+        cache_key = hashlib.md5(href.encode()).hexdigest()
+        if cache_key in self.cache:
+            self._debug("Using cached file:", href)
+            return self.cache[cache_key]
 
         self._debug("Downloading file:", href)
         try:
@@ -86,7 +186,6 @@ class QuizSolver:
         ct = r.headers.get("content-type", "").lower()
         ext = ""
         ftype = "other"
-
         lower_href = href.lower()
 
         if "pdf" in ct or lower_href.endswith(".pdf"):
@@ -95,7 +194,7 @@ class QuizSolver:
         elif "csv" in ct or lower_href.endswith(".csv"):
             ext = ".csv"
             ftype = "csv"
-        elif "excel" in ct or lower_href.endswith(".xlsx"):
+        elif "excel" in ct or any(lower_href.endswith(x) for x in [".xlsx", ".xls"]):
             ext = ".xlsx"
             ftype = "xlsx"
         elif "json" in ct or lower_href.endswith(".json"):
@@ -104,6 +203,9 @@ class QuizSolver:
         elif any(lower_href.endswith(x) for x in [".mp3", ".wav", ".ogg", ".m4a", ".flac"]):
             ext = "." + lower_href.split(".")[-1].split("?")[0]
             ftype = "audio"
+        elif any(lower_href.endswith(x) for x in [".txt", ".log"]):
+            ext = ".txt"
+            ftype = "text"
         else:
             name = href.split("/")[-1]
             if "." in name:
@@ -112,54 +214,109 @@ class QuizSolver:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
         tmp.write(content)
         tmp.close()
-        return tmp.name, content, ftype
+
+        result = (tmp.name, content, ftype)
+        self.cache[cache_key] = result
+        return result
 
     def _summarise_csv_xlsx(self, path: str) -> Dict[str, Any]:
-        """Return compact JSON summary of CSV/XLSX."""
+        """CSV/XLSX analysis with stats + sample rows."""
         try:
             if path.endswith(".csv"):
-                df = pd.read_csv(path, nrows=2000)
+                df = pd.read_csv(path, nrows=5000)
             else:
-                df = pd.read_excel(path, nrows=2000)
+                df = pd.read_excel(path, nrows=5000)
         except Exception as e:
             self._debug("CSV/XLSX read error:", e)
             return {"type": "table", "error": str(e)}
 
-        # Compact representation: columns + first 30 rows
-        max_rows = 30
-        preview = df.head(max_rows)
-        rows = preview.to_dict(orient="records")
-
-        summary = {
+        summary: Dict[str, Any] = {
             "type": "table",
             "columns": list(df.columns),
-            "n_rows_sampled": len(rows),
-            "rows": rows,
+            "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+            "shape": df.shape,
+            "null_counts": df.isnull().sum().to_dict(),
         }
+
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        if numeric_cols:
+            stats: Dict[str, Any] = {}
+            for col in numeric_cols:
+                col_ser = df[col]
+                if col_ser.isna().all():
+                    stats[col] = {
+                        "mean": None,
+                        "median": None,
+                        "std": None,
+                        "min": None,
+                        "max": None,
+                        "sum": None,
+                        "count": 0,
+                    }
+                else:
+                    stats[col] = {
+                        "mean": float(col_ser.mean()),
+                        "median": float(col_ser.median()),
+                        "std": float(col_ser.std()),
+                        "min": float(col_ser.min()),
+                        "max": float(col_ser.max()),
+                        "sum": float(col_ser.sum()),
+                        "count": int(col_ser.count()),
+                    }
+            summary["numeric_stats"] = stats
+
+        preview = df.head(50)
+        summary["sample_rows"] = preview.to_dict(orient="records")
+
+        categorical_cols = df.select_dtypes(include=["object"]).columns.tolist()
+        value_counts: Dict[str, Dict[str, int]] = {}
+        for col in categorical_cols:
+            if df[col].nunique() <= 20:
+                value_counts[col] = df[col].value_counts().to_dict()
+        if value_counts:
+            summary["value_counts"] = value_counts
+
         return summary
 
     def _summarise_pdf(self, path: str) -> Dict[str, Any]:
-        """Extract text & simple tables from first few pages of PDF."""
-        out: Dict[str, Any] = {"type": "pdf", "pages": []}
+        out: Dict[str, Any] = {"type": "pdf", "pages": [], "metadata": {}}
         try:
             with pdfplumber.open(path) as pdf:
-                max_pages = min(len(pdf.pages), 5)
+                out["metadata"] = pdf.metadata or {}
+                max_pages = min(len(pdf.pages), 10)
                 for i in range(max_pages):
                     page = pdf.pages[i]
                     text = page.extract_text() or ""
-                    text = text[:4000]  # limit per page
-                    tables_data = []
+                    page_data: Dict[str, Any] = {
+                        "page_index": i,
+                        "text": text[:6000],
+                        "tables": [],
+                        "numbers_found": [],
+                    }
                     tables = page.extract_tables()
                     if tables:
-                        for t in tables[:3]:
-                            tables_data.append(t[:10])  # at most 10 rows
-                    out["pages"].append(
-                        {"page_index": i, "text": text, "tables": tables_data}
-                    )
+                        for t in tables[:5]:
+                            if t:
+                                page_data["tables"].append(t[:20])
+                    numbers = re.findall(r"-?\d+\.?\d*", text)
+                    page_data["numbers_found"] = numbers[:100]
+                    out["pages"].append(page_data)
         except Exception as e:
             self._debug("PDF summary error:", e)
             out["error"] = str(e)
         return out
+
+    def _summarise_text_file(self, path: str) -> Dict[str, Any]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read(10000)
+            return {
+                "type": "text",
+                "content": content,
+                "numbers": re.findall(r"-?\d+\.?\d*", content),
+            }
+        except Exception as e:
+            return {"type": "text", "error": str(e)}
 
     def _summarise_json_file(self, path: str) -> Dict[str, Any]:
         try:
@@ -169,19 +326,16 @@ class QuizSolver:
             self._debug("JSON file read error:", e)
             return {"type": "json", "error": str(e)}
 
-        # Truncate if very large
-        try:
-            text = json.dumps(data)
-            if len(text) > 8000:
-                # show keys/top structure, not full
-                if isinstance(data, dict):
-                    data = {"keys": list(data.keys())[:100]}
-                elif isinstance(data, list):
-                    data = data[:50]
-        except Exception:
-            pass
-
-        return {"type": "json", "data": data}
+        summary: Dict[str, Any] = {"type": "json", "data": data}
+        if isinstance(data, dict):
+            summary["keys"] = list(data.keys())
+            summary["structure"] = "object"
+        elif isinstance(data, list):
+            summary["length"] = len(data)
+            summary["structure"] = "array"
+            if data and isinstance(data[0], dict):
+                summary["sample_keys"] = list(data[0].keys())
+        return summary
 
     # ------------------------------------------------------------------
     # Audio transcription via AI Pipe LLM
@@ -191,7 +345,7 @@ class QuizSolver:
             self._debug("No AIPIPE_TOKEN set; cannot transcribe audio")
             return None
 
-        self._debug("Transcribing audio via AIPipe...")
+        self._debug(f"Transcribing audio ({len(audio_bytes)} bytes) via AIPipe...")
         b64 = base64.b64encode(audio_bytes).decode("utf-8")
         fmt = ext.lstrip(".") or "mp3"
 
@@ -205,7 +359,11 @@ class QuizSolver:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a perfect speech-to-text engine. Return ONLY the exact transcript.",
+                    "content": (
+                        "You are a perfect speech-to-text engine. "
+                        "Transcribe the audio exactly, including numbers and instructions. "
+                        "Return ONLY the transcript text."
+                    ),
                 },
                 {
                     "role": "user",
@@ -220,29 +378,114 @@ class QuizSolver:
         }
 
         try:
-            r = self.session.post(url, headers=headers, json=payload, timeout=60)
+            r = self.session.post(url, headers=headers, json=payload, timeout=90)
             data = r.json()
             content = data["choices"][0]["message"]["content"]
             if isinstance(content, list):
-                # openrouter may return list-of-parts
                 text_parts = [p.get("text", "") for p in content if isinstance(p, dict)]
                 transcript = " ".join(text_parts).strip()
             else:
                 transcript = str(content).strip()
-            self._debug("Audio transcript:", transcript[:200])
+            self._debug("Audio transcript:", transcript[:300])
             return transcript
         except Exception as e:
             self._debug("AIPipe audio error:", e)
             return None
 
     # ------------------------------------------------------------------
-    # LLM reasoning over whole context
+    # Audio → CSV instruction parsing + numeric computation
+    # ------------------------------------------------------------------
+    def _parse_audio_instructions(self, transcript: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse instructions like:
+        'Download the CSV on this page. Sum all values in column 1
+         where the cutoff column is greater than 26779.'
+        """
+        t = transcript.lower()
+        col = None
+        cutoff = None
+
+        # column N
+        m = re.search(r"column\s+(\d+)", t)
+        if m:
+            col = int(m.group(1)) - 1  # 1-based -> 0-based
+
+        # cutoff from 'cutoff: 26779' or 'cutoff 26779'
+        m = re.search(r"cutoff\s*[:\- ]\s*(\d+)", t)
+        if m:
+            cutoff = float(m.group(1))
+
+        # or 'greater than 26779'
+        m = re.search(r"greater than\s+(\d+)", t)
+        if m:
+            cutoff = float(m.group(1))
+
+        if col is None or cutoff is None:
+            return None
+
+        # Assume cutoff is in column 1 (index 1) unless stated otherwise
+        return {
+            "operation": "sum",
+            "value_column": col,
+            "cutoff_column": 1,  # second column (index 1)
+            "cutoff_value": cutoff,
+        }
+
+    def _compute_from_csv_instruction(self, file_path: str, instr: Dict[str, Any]) -> float:
+        """Execute parsed instruction deterministically using pandas."""
+        if file_path.endswith(".csv"):
+            df = pd.read_csv(file_path)
+        else:
+            df = pd.read_excel(file_path)
+
+        vcol = instr["value_column"]
+        ccol = instr["cutoff_column"]
+        cutoff = instr["cutoff_value"]
+
+        # Defensive checks
+        if vcol < 0 or vcol >= df.shape[1]:
+            raise ValueError("Invalid value_column index")
+        if ccol < 0 or ccol >= df.shape[1]:
+            raise ValueError("Invalid cutoff_column index")
+
+        value_series = pd.to_numeric(df.iloc[:, vcol], errors="coerce")
+        cutoff_series = pd.to_numeric(df.iloc[:, ccol], errors="coerce")
+
+        mask = cutoff_series > cutoff
+        result = float(value_series[mask].sum())
+        return result
+
+    def _try_audio_csv_solve(
+        self,
+        file_summaries: List[Dict[str, Any]],
+        audio_transcripts: List[Dict[str, Any]],
+    ) -> Optional[float]:
+        """If audio + CSV present, try deterministic numeric solution."""
+        if not audio_transcripts or not file_summaries:
+            return None
+
+        transcript = audio_transcripts[0]["transcript"]
+        instr = self._parse_audio_instructions(transcript)
+        if not instr:
+            return None
+
+        # Find first CSV/XLSX with file_path
+        for f in file_summaries:
+            if f.get("kind") in ("csv", "xlsx") and "file_path" in f:
+                try:
+                    ans = self._compute_from_csv_instruction(f["file_path"], instr)
+                    self._debug("Deterministic audio+CSV answer:", ans)
+                    return ans
+                except Exception as e:
+                    self._debug("Deterministic CSV compute failed:", e)
+                    return None
+
+        return None
+
+    # ------------------------------------------------------------------
+    # LLM reasoning
     # ------------------------------------------------------------------
     def _llm_solve_from_context(self, context: Dict[str, Any]) -> Any:
-        """
-        Send page+files+audio context to LLM.
-        LLM must return JSON like {"answer": ...}.
-        """
         if not AIPIPE_TOKEN:
             self._debug("No AIPIPE_TOKEN set; cannot use LLM")
             return None
@@ -253,22 +496,27 @@ class QuizSolver:
             "Content-Type": "application/json",
         }
 
-        # Compact JSON string for context
-        context_json = json.dumps(context, ensure_ascii=False)
-        if len(context_json) > 20000:
-            context_json = context_json[:20000]  # hard cap
+        context_text = self._build_context_text(context)
 
         system_prompt = (
-            "You are solving data-analysis quiz questions from IITM TDS. "
-            "You will receive a JSON object describing a quiz webpage: page text, "
-            "HTML snippet, links, decoded scripts, file summaries (tables, PDFs, JSON), "
-            "and audio transcripts with instructions.\n\n"
-            "Your job: Carefully read all instructions and data, perform any required "
-            "calculations or reasoning, and determine the FINAL ANSWER.\n\n"
-            "OUTPUT FORMAT (IMPORTANT): Return ONLY a valid JSON object with a single key 'answer'. "
-            "For example: {\"answer\": 12345} or {\"answer\": \"some string\"} or "
-            "{\"answer\": true} or {\"answer\": {\"x\": 1, \"y\": 2}}. "
-            "Do NOT include explanations, extra keys, or plain text outside JSON."
+            "You are an expert data analyst solving quiz questions. You will receive:\n"
+            "1. Page content (text)\n"
+            "2. Hidden data (decoded scripts, JSON, data attributes)\n"
+            "3. File summaries (CSV statistics, PDF content, JSON data)\n"
+            "4. Audio transcripts with instructions\n\n"
+            "Your task:\n"
+            "- Understand the question\n"
+            "- Identify relevant data (cutoff values, column names, file references)\n"
+            "- Perform logical reasoning\n"
+            "- Determine the FINAL ANSWER\n\n"
+            "Return ONLY valid JSON in this exact format:\n"
+            '{"answer": <your_answer>}\n\n'
+            "Examples:\n"
+            '- {"answer": 42}\n'
+            '- {"answer": "YELLOW"}\n'
+            '- {"answer": 3.14159}\n'
+            '- {"answer": true}\n\n"
+            "Do NOT include explanations or extra keys."
         )
 
         payload = {
@@ -278,32 +526,111 @@ class QuizSolver:
                 {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
-                    "content": f"Here is the quiz page context JSON:\n{context_json}",
+                    "content": f"Quiz context:\n\n{context_text}",
                 },
             ],
         }
 
         try:
-            r = self.session.post(url, headers=headers, json=payload, timeout=90)
+            r = self.session.post(url, headers=headers, json=payload, timeout=120)
             data = r.json()
             content = data["choices"][0]["message"]["content"]
 
             if isinstance(content, str):
                 answer_obj = json.loads(content)
             else:
-                # Sometimes it's already parsed as dict
                 answer_obj = content
 
-            self._debug("LLM raw answer_obj:", answer_obj)
+            self._debug("LLM answer object:", answer_obj)
             if isinstance(answer_obj, dict) and "answer" in answer_obj:
                 return answer_obj["answer"]
         except Exception as e:
-            self._debug("AIPipe reasoning error:", e)
+            self._debug("LLM reasoning error:", e)
 
         return None
 
+    def _build_context_text(self, context: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        parts.append("=== PAGE INFORMATION ===")
+        parts.append(f"URL: {context.get('page_url', '')}")
+        parts.append(f"\nVISIBLE TEXT:\n{context.get('page_text', '')[:8000]}")
+
+        hd = context.get("hidden_data")
+        if hd:
+            parts.append("\n=== HIDDEN DATA ===")
+            if hd.get("atob_decoded"):
+                parts.append(
+                    "\nBase64 Decoded Content:\n"
+                    + json.dumps(hd["atob_decoded"], indent=2)
+                )
+            if hd.get("script_variables"):
+                parts.append(
+                    "\nJavaScript Variables:\n"
+                    + json.dumps(hd["script_variables"][:20], indent=2)
+                )
+            if hd.get("hidden_inputs"):
+                parts.append(
+                    "\nHidden Form Inputs:\n"
+                    + json.dumps(hd["hidden_inputs"], indent=2)
+                )
+            if hd.get("data_attributes"):
+                parts.append(
+                    "\nData Attributes:\n"
+                    + json.dumps(hd["data_attributes"][:10], indent=2)
+                )
+
+        files = context.get("files", [])
+        if files:
+            parts.append("\n=== FILES ANALYSIS ===")
+            for i, file_info in enumerate(files[:5]):
+                parts.append(f"\n--- File {i+1}: {file_info.get('href', '')} ---")
+                parts.append(f"Type: {file_info.get('kind', '')}")
+                summary = file_info.get("summary", {})
+                parts.append(json.dumps(summary, indent=2)[:4000])
+
+        if context.get("audio_transcripts"):
+            parts.append("\n=== AUDIO TRANSCRIPTS ===")
+            for i, audio in enumerate(context["audio_transcripts"]):
+                parts.append(f"\nAudio {i+1} ({audio.get('href', '')}):")
+                parts.append(audio.get("transcript", ""))
+
+        full_text = "\n".join(parts)
+        if len(full_text) > 25000:
+            full_text = full_text[:25000] + "\n\n[Content truncated due to length]"
+        return full_text
+
     # ------------------------------------------------------------------
-    # Solve ONE page (build context → LLM → submit)
+    # Fallback answer
+    # ------------------------------------------------------------------
+    def _fallback_answer(self, context: Dict[str, Any]) -> Any:
+        page_text = context.get("page_text", "")
+        patterns = [
+            r"answer[:\s]+(\d+\.?\d*)",
+            r"result[:\s]+(\d+\.?\d*)",
+            r"total[:\s]+(\d+\.?\d*)",
+            r"sum[:\s]+(\d+\.?\d*)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, page_text, re.IGNORECASE)
+            if match:
+                val = match.group(1)
+                try:
+                    return float(val)
+                except Exception:
+                    return val
+
+        nums = re.findall(r"-?\d+\.?\d*", page_text)
+        if nums:
+            val = nums[-1]
+            try:
+                return float(val)
+            except Exception:
+                return val
+
+        return "unable_to_determine"
+
+    # ------------------------------------------------------------------
+    # Solve ONE page
     # ------------------------------------------------------------------
     def _solve_one_page(
         self, page: Page, url: str, time_left: float
@@ -311,47 +638,66 @@ class QuizSolver:
         if time_left < 10:
             return None, None, None, {"error": "timeout"}
 
-        # protect from infinite loops
         h = hashlib.md5(url.encode()).hexdigest()
         if h in self.visited:
-            return None, None, None, {"error": "visited"}
+            return None, None, None, {"error": "already_visited"}
         self.visited.add(h)
 
-        self._debug("=== Visiting ===", url)
+        self._debug("=" * 60)
+        self._debug(f"ANALYZING PAGE: {url}")
+        self._debug("=" * 60)
 
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=40000)
-            page.wait_for_timeout(800)
+            page.goto(url, wait_until="networkidle", timeout=50000)
+            page.wait_for_timeout(1500)
         except Exception as e:
             self._debug("Page load error:", e)
+            try:
+                page.wait_for_timeout(2000)
+            except Exception:
+                pass
 
         html = page.content()
         soup = BeautifulSoup(html, "html.parser")
         page_text = soup.get_text(separator="\n", strip=True)
 
+        hidden_data = self._extract_hidden_data(html, page)
         submit_url = self._find_submit_url(html, url)
-        atob_chunks = self._extract_atob_chunks(html)
 
         # Collect links
-        links_summary = []
+        links_summary: List[Dict[str, Any]] = []
         for a in soup.find_all("a", href=True):
             links_summary.append(
                 {
-                    "text": (a.get_text(strip=True) or "")[:200],
+                    "text": (a.get_text(strip=True) or "")[:300],
                     "href": a["href"],
                 }
             )
-            if len(links_summary) >= 50:
-                break
 
-        # Detect & summarise files
-        file_summaries = []
-        audio_transcripts = []
+        # Files & audio
+        file_summaries: List[Dict[str, Any]] = []
+        audio_transcripts: List[Dict[str, Any]] = []
 
         for a in soup.find_all("a", href=True):
             href = a["href"]
             lower = href.lower()
-            if any(lower.endswith(x) for x in (".csv", ".xlsx", ".pdf", ".json", ".mp3", ".wav", ".ogg", ".m4a", ".flac")):
+            if any(
+                lower.endswith(x)
+                for x in (
+                    ".csv",
+                    ".xlsx",
+                    ".xls",
+                    ".pdf",
+                    ".json",
+                    ".mp3",
+                    ".wav",
+                    ".ogg",
+                    ".m4a",
+                    ".flac",
+                    ".txt",
+                    ".log",
+                )
+            ):
                 dl = self._download_file(href, url)
                 if not dl:
                     continue
@@ -362,6 +708,7 @@ class QuizSolver:
                         {
                             "href": href,
                             "kind": ftype,
+                            "file_path": path,  # IMPORTANT for numeric calc
                             "summary": self._summarise_csv_xlsx(path),
                         }
                     )
@@ -381,43 +728,54 @@ class QuizSolver:
                             "summary": self._summarise_json_file(path),
                         }
                     )
-                elif ftype == "audio":
-                    transcript = self._transcribe_audio_llm(content, os.path.splitext(path)[1])
-                    audio_transcripts.append(
-                        {"href": href, "transcript": transcript}
+                elif ftype == "text":
+                    file_summaries.append(
+                        {
+                            "href": href,
+                            "kind": "text",
+                            "summary": self._summarise_text_file(path),
+                        }
                     )
+                elif ftype == "audio":
+                    transcript = self._transcribe_audio_llm(
+                        content, os.path.splitext(path)[1]
+                    )
+                    if transcript:
+                        audio_transcripts.append(
+                            {
+                                "href": href,
+                                "transcript": transcript,
+                            }
+                        )
 
-        # Short HTML snippet
-        html_snippet = html[:8000]
+        # First try deterministic audio+CSV solver
+        answer: Any = None
+        det_ans = self._try_audio_csv_solve(file_summaries, audio_transcripts)
+        if det_ans is not None:
+            answer = det_ans
+            self._debug("Using deterministic audio+CSV answer")
+        else:
+            # Build context for LLM
+            context: Dict[str, Any] = {
+                "page_url": url,
+                "page_text": page_text,
+                "hidden_data": hidden_data,
+                "links": links_summary,
+                "files": file_summaries,
+                "audio_transcripts": audio_transcripts,
+            }
 
-        # Build full context for LLM
-        context: Dict[str, Any] = {
-            "page_url": url,
-            "page_text": page_text[:12000],
-            "html_snippet": html_snippet,
-            "links": links_summary,
-            "decoded_scripts": atob_chunks[:10],
-            "files": file_summaries,
-            "audio_transcripts": audio_transcripts,
-        }
+            # LLM reasoning
+            answer = self._llm_solve_from_context(context)
 
-        # LLM reasoning
-        answer = self._llm_solve_from_context(context)
-
-        # Fallback: last number on page, if LLM failed
-        if answer is None:
-            nums = re.findall(r"\d+\.?\d*", page_text)
-            if nums:
-                try:
-                    answer = float(nums[-1])
-                except Exception:
-                    answer = nums[-1]
-            else:
-                answer = "default"
+            # Fallback if LLM fails
+            if answer is None:
+                self._debug("LLM failed, using fallback logic...")
+                answer = self._fallback_answer(context)
 
         self._debug("FINAL ANSWER:", answer)
 
-        # Submit to quiz engine
+        # Submit
         submit_resp: Dict[str, Any] = {"error": "no-submit-url"}
         next_url = None
 
@@ -428,30 +786,31 @@ class QuizSolver:
                 "url": url,
                 "answer": answer,
             }
-            self._debug("Submitting to:", submit_url, "payload:", payload)
-
+            self._debug("Submitting to:", submit_url)
             try:
                 r = self.session.post(submit_url, json=payload, timeout=30)
                 try:
                     submit_resp = r.json()
                 except Exception:
-                    submit_resp = {"text": r.text}
-                if isinstance(submit_resp, Dict):
+                    submit_resp = {"text": r.text[:500]}
+                if isinstance(submit_resp, dict):
                     next_url = submit_resp.get("url")
+                    self._debug("Next URL:", next_url)
             except Exception as e:
                 submit_resp = {"error": str(e)}
 
         return answer, submit_url, next_url, submit_resp
 
     # ------------------------------------------------------------------
-    # Public orchestrator
+    # Orchestrator
     # ------------------------------------------------------------------
-    def solve_and_submit(self, url: str, time_budget_sec: int = 170) -> Dict[str, Any]:
+    def solve_and_submit(self, url: str, time_budget_sec: int = 180) -> Dict[str, Any]:
         start = time.time()
         result: Dict[str, Any] = {
             "first": None,
             "submissions": [],
             "completed": False,
+            "total_time": 0,
         }
 
         with sync_playwright() as p:
@@ -462,15 +821,24 @@ class QuizSolver:
                         "--no-sandbox",
                         "--disable-setuid-sandbox",
                         "--disable-dev-shm-usage",
+                        "--disable-gpu",
                     ],
                 )
             except Exception as e:
                 return {"error": f"browser-launch-failed: {e}"}
 
-            page = browser.new_page()
-            page.set_default_timeout(40000)
+            context = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            )
+            page = context.new_page()
+            page.set_default_timeout(50000)
 
-            # First URL
+            # First page
             elapsed = time.time() - start
             ans, s_url, nxt, resp = self._solve_one_page(
                 page, url, time_budget_sec - elapsed
@@ -482,33 +850,59 @@ class QuizSolver:
                 "submit_response": resp,
             }
 
-            # Chain of follow-up URLs
+            # Chain
             steps = 0
-            while nxt and steps < 40:
+            max_steps = 50
+
+            while nxt and steps < max_steps:
                 elapsed = time.time() - start
-                if elapsed > 165:
-                    self._debug("Global time limit reached")
+                if elapsed > time_budget_sec - 15:
+                    self._debug("Time budget nearly exhausted")
                     break
 
                 steps += 1
-                self._debug(f"--- Chain step {steps}: {nxt} ---")
+                self._debug("\n" + "=" * 60)
+                self._debug(f"CHAIN STEP {steps}: {nxt}")
+                self._debug("=" * 60 + "\n")
+
                 ans2, s_url2, nxt2, resp2 = self._solve_one_page(
                     page, nxt, time_budget_sec - elapsed
                 )
-                if ans2 is None:
+
+                if ans2 is None and resp2.get("error") == "already_visited":
+                    self._debug("Breaking due to loop detection")
                     break
+
                 result["submissions"].append(
                     {
+                        "step": steps,
                         "url": nxt,
                         "answer": ans2,
                         "submit_url": s_url2,
                         "submit_response": resp2,
                     }
                 )
+
                 nxt = nxt2
 
             browser.close()
             result["completed"] = nxt is None
             result["total_time"] = time.time() - start
+            result["total_steps"] = steps
 
         return result
+
+
+# Example standalone usage (not needed in Railway/FastAPI)
+if __name__ == "__main__":
+    EMAIL = os.getenv("QUIZ_EMAIL", "your-email@example.com")
+    SECRET = os.getenv("QUIZ_SECRET", "your-secret")
+    START_URL = os.getenv("QUIZ_URL", "https://tds-llm-analysis.s-anand.net/demo")
+
+    solver = EnhancedQuizSolver(email=EMAIL, secret=SECRET)
+    result = solver.solve_and_submit(START_URL)
+
+    print("\n" + "=" * 60)
+    print("FINAL RESULT")
+    print("=" * 60)
+    print(json.dumps(result, indent=2))
