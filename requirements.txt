@@ -6,4 +6,13 @@ pydantic
 python-dotenv
 pandas
 pdfplumber
+
 python-multipart
+requests
+pdfplumber
+pandas
+beautifulsoup4
+pydub
+SpeechRecognition
+openai
+playwright
