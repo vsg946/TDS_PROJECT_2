@@ -43,7 +43,7 @@ class EnhancedQuizSolver:
         for pattern in patterns:
             m = re.search(pattern, html, re.IGNORECASE)
             if m:
-                url = m.group(1) if len(m.groups()) > 0 else m.group(0)
+                url = m.group(1) if m.groups() else m.group(0)
                 if url.startswith("http"):
                     return url
                 return urljoin(page_url, url)
@@ -55,7 +55,7 @@ class EnhancedQuizSolver:
             if "submit" in action.lower():
                 return urljoin(page_url, action)
 
-        # Fallback
+        # Default fallback
         if "/submit" in html.lower():
             p = urlparse(page_url)
             return f"{p.scheme}://{p.netloc}/submit"
@@ -74,7 +74,7 @@ class EnhancedQuizSolver:
             return None
 
     def _extract_hidden_data(self, html: str, page: Page) -> Dict[str, Any]:
-        """Extract hidden data: atob, JSON, vars, hidden inputs, data-*, etc."""
+        """Extract hidden data: atob, JSON, hidden inputs, data attrs, etc."""
         hidden_data: Dict[str, Any] = {
             "atob_decoded": [],
             "json_objects": [],
@@ -89,14 +89,14 @@ class EnhancedQuizSolver:
 
         soup = BeautifulSoup(html, "html.parser")
 
-        # 1. Decode atob() calls
+        # 1. atob() payloads
         atob_pattern = r'atob\(\s*[`"\']([^`"\']+)[`"\']\s*\)'
         for m in re.finditer(atob_pattern, html):
             decoded = self._decode_base64(m.group(1))
             if decoded:
                 hidden_data["atob_decoded"].append(decoded)
 
-        # 2. Extract JSON and vars from scripts
+        # 2. JSON and variables from scripts
         for script in soup.find_all("script"):
             script_text = script.string or ""
 
@@ -109,7 +109,7 @@ class EnhancedQuizSolver:
                 except Exception:
                     pass
 
-            # var/let/const assignments
+            # var / let / const
             var_pattern = r"(?:var|let|const)\s+(\w+)\s*=\s*([^;]+);"
             for match in re.finditer(var_pattern, script_text):
                 var_name = match.group(1)
@@ -124,9 +124,13 @@ class EnhancedQuizSolver:
                 {"name": inp.get("name", ""), "value": inp.get("value", "")}
             )
 
-        # 4. data-* attributes
-        for elem in soup.find_all(attrs=lambda x: x and any(k.startswith("data-") for k in x)):
-            data_attrs = {k: v for k, v in elem.attrs.items() if k.startswith("data-")}
+        # 4. Data attributes
+        for elem in soup.find_all(
+            attrs=lambda x: x and any(k.startswith("data-") for k in x)
+        ):
+            data_attrs = {
+                k: v for k, v in elem.attrs.items() if isinstance(k, str) and k.startswith("data-")
+            }
             if data_attrs:
                 hidden_data["data_attributes"].append(
                     {"tag": elem.name, "attributes": data_attrs}
@@ -149,7 +153,7 @@ class EnhancedQuizSolver:
         except Exception:
             pass
 
-        # 7. cookies
+        # 7. Cookies
         try:
             cookies = page.context.cookies()
             hidden_data["cookies"] = {c["name"]: c["value"] for c in cookies}
@@ -159,11 +163,12 @@ class EnhancedQuizSolver:
         return hidden_data
 
     # ------------------------------------------------------------------
-    # Download + File Summaries
+    # Download + File Summarisation
     # ------------------------------------------------------------------
     def _download_file(self, href: str, base_url: str) -> Optional[Tuple[str, bytes, str]]:
         if not href:
             return None
+
         if not href.lower().startswith("http"):
             href = urljoin(base_url, href)
 
@@ -220,7 +225,7 @@ class EnhancedQuizSolver:
         return result
 
     def _summarise_csv_xlsx(self, path: str) -> Dict[str, Any]:
-        """CSV/XLSX analysis with stats + sample rows."""
+        """Analyse CSV/XLSX: stats, preview, value counts."""
         try:
             if path.endswith(".csv"):
                 df = pd.read_csv(path, nrows=5000)
@@ -238,6 +243,7 @@ class EnhancedQuizSolver:
             "null_counts": df.isnull().sum().to_dict(),
         }
 
+        # Numeric stats
         numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
         if numeric_cols:
             stats: Dict[str, Any] = {}
@@ -265,9 +271,11 @@ class EnhancedQuizSolver:
                     }
             summary["numeric_stats"] = stats
 
+        # Preview rows
         preview = df.head(50)
         summary["sample_rows"] = preview.to_dict(orient="records")
 
+        # Value counts for small-cardinality categoricals
         categorical_cols = df.select_dtypes(include=["object"]).columns.tolist()
         value_counts: Dict[str, Dict[str, int]] = {}
         for col in categorical_cols:
@@ -279,6 +287,7 @@ class EnhancedQuizSolver:
         return summary
 
     def _summarise_pdf(self, path: str) -> Dict[str, Any]:
+        """Summarise PDFs: text, tables, numbers."""
         out: Dict[str, Any] = {"type": "pdf", "pages": [], "metadata": {}}
         try:
             with pdfplumber.open(path) as pdf:
@@ -293,13 +302,16 @@ class EnhancedQuizSolver:
                         "tables": [],
                         "numbers_found": [],
                     }
+
                     tables = page.extract_tables()
                     if tables:
                         for t in tables[:5]:
                             if t:
                                 page_data["tables"].append(t[:20])
+
                     numbers = re.findall(r"-?\d+\.?\d*", text)
                     page_data["numbers_found"] = numbers[:100]
+
                     out["pages"].append(page_data)
         except Exception as e:
             self._debug("PDF summary error:", e)
@@ -338,14 +350,14 @@ class EnhancedQuizSolver:
         return summary
 
     # ------------------------------------------------------------------
-    # Audio transcription via AI Pipe LLM
+    # Audio handling + CSV instruction execution
     # ------------------------------------------------------------------
     def _transcribe_audio_llm(self, audio_bytes: bytes, ext: str) -> Optional[str]:
         if not AIPIPE_TOKEN:
             self._debug("No AIPIPE_TOKEN set; cannot transcribe audio")
             return None
 
-        self._debug(f"Transcribing audio ({len(audio_bytes)} bytes) via AIPipe...")
+        self._debug(f"Transcribing audio via AIPipe ({len(audio_bytes)} bytes)...")
         b64 = base64.b64encode(audio_bytes).decode("utf-8")
         fmt = ext.lstrip(".") or "mp3"
 
@@ -392,102 +404,66 @@ class EnhancedQuizSolver:
             self._debug("AIPipe audio error:", e)
             return None
 
-    # ------------------------------------------------------------------
-    # Audio → CSV instruction parsing + numeric computation
-    # ------------------------------------------------------------------
-    def _parse_audio_instructions(self, transcript: str) -> Optional[Dict[str, Any]]:
+    def _try_audio_csv_solve(self, transcript: str, csv_path: str) -> Optional[float]:
         """
-        Parse instructions like:
-        'Download the CSV on this page. Sum all values in column 1
-         where the cutoff column is greater than 26779.'
+        Handle instructions like:
+        - "Add all values in column 1 greater than the cutoff 26779 in demo-audio-data.csv"
         """
         t = transcript.lower()
-        col = None
+        if not any(word in t for word in ["sum", "add", "total", "cutoff", "greater than"]):
+            return None
+
+        # Find cutoff
         cutoff = None
-
-        # column N
-        m = re.search(r"column\s+(\d+)", t)
-        if m:
-            col = int(m.group(1)) - 1  # 1-based -> 0-based
-
-        # cutoff from 'cutoff: 26779' or 'cutoff 26779'
-        m = re.search(r"cutoff\s*[:\- ]\s*(\d+)", t)
+        m = re.search(r"cutoff[^0-9]*([0-9]+)", t)
+        if not m:
+            m = re.search(r"greater than[^0-9]*([0-9]+)", t)
         if m:
             cutoff = float(m.group(1))
 
-        # or 'greater than 26779'
-        m = re.search(r"greater than\s+(\d+)", t)
+        # Column index
+        col_index = 0  # default first column
+        m = re.search(r"column\s+([0-9]+)", t)
         if m:
-            cutoff = float(m.group(1))
+            col_index = max(0, int(m.group(1)) - 1)
+        elif "first column" in t or "column one" in t:
+            col_index = 0
 
-        if col is None or cutoff is None:
+        self._debug("Audio+CSV parsed: cutoff=", cutoff, "col_index=", col_index)
+
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as e:
+            self._debug("Audio-CSV read error:", e)
             return None
 
-        # Assume cutoff is in column 1 (index 1) unless stated otherwise
-        return {
-            "operation": "sum",
-            "value_column": col,
-            "cutoff_column": 1,  # second column (index 1)
-            "cutoff_value": cutoff,
-        }
-
-    def _compute_from_csv_instruction(self, file_path: str, instr: Dict[str, Any]) -> float:
-        """Execute parsed instruction deterministically using pandas."""
-        if file_path.endswith(".csv"):
-            df = pd.read_csv(file_path)
+        # Try to pick numeric column at given index
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        if numeric_cols:
+            if col_index < len(numeric_cols):
+                col_name = numeric_cols[col_index]
+            else:
+                col_name = numeric_cols[0]
         else:
-            df = pd.read_excel(file_path)
+            # fall back to positional
+            if col_index >= df.shape[1]:
+                col_index = 0
+            col_name = df.columns[col_index]
 
-        vcol = instr["value_column"]
-        ccol = instr["cutoff_column"]
-        cutoff = instr["cutoff_value"]
+        ser = pd.to_numeric(df[col_name], errors="coerce").dropna()
+        if cutoff is not None:
+            ser = ser[ser > cutoff]
 
-        # Defensive checks
-        if vcol < 0 or vcol >= df.shape[1]:
-            raise ValueError("Invalid value_column index")
-        if ccol < 0 or ccol >= df.shape[1]:
-            raise ValueError("Invalid cutoff_column index")
-
-        value_series = pd.to_numeric(df.iloc[:, vcol], errors="coerce")
-        cutoff_series = pd.to_numeric(df.iloc[:, ccol], errors="coerce")
-
-        mask = cutoff_series > cutoff
-        result = float(value_series[mask].sum())
-        return result
-
-    def _try_audio_csv_solve(
-        self,
-        file_summaries: List[Dict[str, Any]],
-        audio_transcripts: List[Dict[str, Any]],
-    ) -> Optional[float]:
-        """If audio + CSV present, try deterministic numeric solution."""
-        if not audio_transcripts or not file_summaries:
-            return None
-
-        transcript = audio_transcripts[0]["transcript"]
-        instr = self._parse_audio_instructions(transcript)
-        if not instr:
-            return None
-
-        # Find first CSV/XLSX with file_path
-        for f in file_summaries:
-            if f.get("kind") in ("csv", "xlsx") and "file_path" in f:
-                try:
-                    ans = self._compute_from_csv_instruction(f["file_path"], instr)
-                    self._debug("Deterministic audio+CSV answer:", ans)
-                    return ans
-                except Exception as e:
-                    self._debug("Deterministic CSV compute failed:", e)
-                    return None
-
-        return None
+        total = float(ser.sum())
+        self._debug("Audio-CSV computed sum:", total)
+        return total
 
     # ------------------------------------------------------------------
     # LLM reasoning
     # ------------------------------------------------------------------
     def _llm_solve_from_context(self, context: Dict[str, Any]) -> Any:
         if not AIPIPE_TOKEN:
-            self._debug("No AIPIPE_TOKEN set; cannot use LLM")
+            self._debug("No AIPIPE_TOKEN set; cannot use LLM for reasoning")
             return None
 
         url = "https://aipipe.org/openrouter/v1/chat/completions"
@@ -498,36 +474,36 @@ class EnhancedQuizSolver:
 
         context_text = self._build_context_text(context)
 
-        system_prompt = (
-            "You are an expert data analyst solving quiz questions. You will receive:\n"
-            "1. Page content (text)\n"
-            "2. Hidden data (decoded scripts, JSON, data attributes)\n"
-            "3. File summaries (CSV statistics, PDF content, JSON data)\n"
-            "4. Audio transcripts with instructions\n\n"
-            "Your task:\n"
-            "- Understand the question\n"
-            "- Identify relevant data (cutoff values, column names, file references)\n"
-            "- Perform logical reasoning\n"
-            "- Determine the FINAL ANSWER\n\n"
-            "Return ONLY valid JSON in this exact format:\n"
-            '{"answer": <your_answer>}\n\n'
-            "Examples:\n"
-            '- {"answer": 42}\n'
-            '- {"answer": "YELLOW"}\n'
-            '- {"answer": 3.14159}\n'
-            '- {"answer": true}\n\n"
-            "Do NOT include explanations or extra keys."
-        )
+        system_prompt = '''You are an expert data analyst solving quiz questions. You will receive:
+1. Page content (text, HTML)
+2. Hidden data (decoded scripts, JSON, data attributes)
+3. File summaries (CSV statistics, PDF content, JSON data)
+4. Audio transcripts with instructions
+
+Your task:
+- Read ALL information carefully
+- Identify the question being asked
+- Locate relevant data (cutoff values, column names, conditions)
+- Perform calculations if needed (sums, counts, filtering)
+- Determine the FINAL ANSWER
+
+CRITICAL: Return ONLY valid JSON in this exact format:
+{"answer": <your_answer>}
+
+Examples:
+- {"answer": 42}
+- {"answer": "text response"}
+- {"answer": 3.14159}
+- {"answer": true}
+
+Do NOT include explanations or extra text.'''
 
         payload = {
             "model": "openai/gpt-4.1-nano",
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": f"Quiz context:\n\n{context_text}",
-                },
+                {"role": "user", "content": f"Quiz context:\n\n{context_text}"},
             ],
         }
 
@@ -551,38 +527,34 @@ class EnhancedQuizSolver:
 
     def _build_context_text(self, context: Dict[str, Any]) -> str:
         parts: List[str] = []
+
         parts.append("=== PAGE INFORMATION ===")
         parts.append(f"URL: {context.get('page_url', '')}")
         parts.append(f"\nVISIBLE TEXT:\n{context.get('page_text', '')[:8000]}")
 
-        hd = context.get("hidden_data")
-        if hd:
+        if context.get("hidden_data"):
+            hd = context["hidden_data"]
             parts.append("\n=== HIDDEN DATA ===")
             if hd.get("atob_decoded"):
                 parts.append(
-                    "\nBase64 Decoded Content:\n"
-                    + json.dumps(hd["atob_decoded"], indent=2)
+                    f"\nBase64 Decoded Content:\n{json.dumps(hd['atob_decoded'], indent=2)}"
                 )
             if hd.get("script_variables"):
                 parts.append(
-                    "\nJavaScript Variables:\n"
-                    + json.dumps(hd["script_variables"][:20], indent=2)
+                    f"\nJavaScript Variables:\n{json.dumps(hd['script_variables'][:20], indent=2)}"
                 )
             if hd.get("hidden_inputs"):
                 parts.append(
-                    "\nHidden Form Inputs:\n"
-                    + json.dumps(hd["hidden_inputs"], indent=2)
+                    f"\nHidden Form Inputs:\n{json.dumps(hd['hidden_inputs'], indent=2)}"
                 )
             if hd.get("data_attributes"):
                 parts.append(
-                    "\nData Attributes:\n"
-                    + json.dumps(hd["data_attributes"][:10], indent=2)
+                    f"\nData Attributes:\n{json.dumps(hd['data_attributes'][:10], indent=2)}"
                 )
 
-        files = context.get("files", [])
-        if files:
+        if context.get("files"):
             parts.append("\n=== FILES ANALYSIS ===")
-            for i, file_info in enumerate(files[:5]):
+            for i, file_info in enumerate(context["files"][:5]):
                 parts.append(f"\n--- File {i+1}: {file_info.get('href', '')} ---")
                 parts.append(f"Type: {file_info.get('kind', '')}")
                 summary = file_info.get("summary", {})
@@ -604,6 +576,7 @@ class EnhancedQuizSolver:
     # ------------------------------------------------------------------
     def _fallback_answer(self, context: Dict[str, Any]) -> Any:
         page_text = context.get("page_text", "")
+
         patterns = [
             r"answer[:\s]+(\d+\.?\d*)",
             r"result[:\s]+(\d+\.?\d*)",
@@ -664,24 +637,22 @@ class EnhancedQuizSolver:
         hidden_data = self._extract_hidden_data(html, page)
         submit_url = self._find_submit_url(html, url)
 
-        # Collect links
-        links_summary: List[Dict[str, Any]] = []
+        # Links (for context)
+        links_summary = []
         for a in soup.find_all("a", href=True):
             links_summary.append(
-                {
-                    "text": (a.get_text(strip=True) or "")[:300],
-                    "href": a["href"],
-                }
+                {"text": (a.get_text(strip=True) or "")[:300], "href": a["href"]}
             )
 
-        # Files & audio
         file_summaries: List[Dict[str, Any]] = []
         audio_transcripts: List[Dict[str, Any]] = []
+        csv_paths: List[str] = []
 
+        # Detect & process files
         for a in soup.find_all("a", href=True):
             href = a["href"]
             lower = href.lower()
-            if any(
+            if not any(
                 lower.endswith(x)
                 for x in (
                     ".csv",
@@ -698,86 +669,96 @@ class EnhancedQuizSolver:
                     ".log",
                 )
             ):
-                dl = self._download_file(href, url)
-                if not dl:
-                    continue
-                path, content, ftype = dl
+                continue
 
-                if ftype in ("csv", "xlsx"):
-                    file_summaries.append(
-                        {
-                            "href": href,
-                            "kind": ftype,
-                            "file_path": path,  # IMPORTANT for numeric calc
-                            "summary": self._summarise_csv_xlsx(path),
-                        }
-                    )
-                elif ftype == "pdf":
-                    file_summaries.append(
-                        {
-                            "href": href,
-                            "kind": "pdf",
-                            "summary": self._summarise_pdf(path),
-                        }
-                    )
-                elif ftype == "json":
-                    file_summaries.append(
-                        {
-                            "href": href,
-                            "kind": "json",
-                            "summary": self._summarise_json_file(path),
-                        }
-                    )
-                elif ftype == "text":
-                    file_summaries.append(
-                        {
-                            "href": href,
-                            "kind": "text",
-                            "summary": self._summarise_text_file(path),
-                        }
-                    )
-                elif ftype == "audio":
-                    transcript = self._transcribe_audio_llm(
-                        content, os.path.splitext(path)[1]
-                    )
-                    if transcript:
-                        audio_transcripts.append(
-                            {
-                                "href": href,
-                                "transcript": transcript,
-                            }
-                        )
+            dl = self._download_file(href, url)
+            if not dl:
+                continue
+            path, content, ftype = dl
 
-        # First try deterministic audio+CSV solver
+            if ftype in ("csv", "xlsx"):
+                if ftype == "csv":
+                    csv_paths.append(path)
+                file_summaries.append(
+                    {
+                        "href": href,
+                        "kind": ftype,
+                        "path": path,
+                        "summary": self._summarise_csv_xlsx(path),
+                    }
+                )
+            elif ftype == "pdf":
+                file_summaries.append(
+                    {
+                        "href": href,
+                        "kind": "pdf",
+                        "path": path,
+                        "summary": self._summarise_pdf(path),
+                    }
+                )
+            elif ftype == "json":
+                file_summaries.append(
+                    {
+                        "href": href,
+                        "kind": "json",
+                        "path": path,
+                        "summary": self._summarise_json_file(path),
+                    }
+                )
+            elif ftype == "text":
+                file_summaries.append(
+                    {
+                        "href": href,
+                        "kind": "text",
+                        "path": path,
+                        "summary": self._summarise_text_file(path),
+                    }
+                )
+            elif ftype == "audio":
+                transcript = self._transcribe_audio_llm(
+                    content, os.path.splitext(path)[1]
+                )
+                if transcript:
+                    audio_transcripts.append(
+                        {"href": href, "transcript": transcript}
+                    )
+
+        # Build context
+        context: Dict[str, Any] = {
+            "page_url": url,
+            "page_text": page_text,
+            "hidden_data": hidden_data,
+            "links": links_summary,
+            "files": file_summaries,
+            "audio_transcripts": audio_transcripts,
+        }
+
+        # --- SPECIAL: audio + CSV rule-based solver (for cutoff problems) ---
         answer: Any = None
-        det_ans = self._try_audio_csv_solve(file_summaries, audio_transcripts)
-        if det_ans is not None:
-            answer = det_ans
-            self._debug("Using deterministic audio+CSV answer")
-        else:
-            # Build context for LLM
-            context: Dict[str, Any] = {
-                "page_url": url,
-                "page_text": page_text,
-                "hidden_data": hidden_data,
-                "links": links_summary,
-                "files": file_summaries,
-                "audio_transcripts": audio_transcripts,
-            }
+        if audio_transcripts and csv_paths:
+            self._debug("Trying rule-based audio+CSV solver...")
+            for audio in audio_transcripts:
+                for csv_path in csv_paths:
+                    ans = self._try_audio_csv_solve(audio["transcript"], csv_path)
+                    if ans is not None:
+                        answer = ans
+                        break
+                if answer is not None:
+                    break
 
-            # LLM reasoning
+        # General LLM reasoning if still unanswered
+        if answer is None:
             answer = self._llm_solve_from_context(context)
 
-            # Fallback if LLM fails
-            if answer is None:
-                self._debug("LLM failed, using fallback logic...")
-                answer = self._fallback_answer(context)
+        if answer is None:
+            self._debug("LLM failed, using fallback logic...")
+            answer = self._fallback_answer(context)
 
         self._debug("FINAL ANSWER:", answer)
 
         # Submit
         submit_resp: Dict[str, Any] = {"error": "no-submit-url"}
-        next_url = None
+        next_url: Optional[str] = None
 
         if submit_url:
             payload = {
@@ -802,7 +783,7 @@ class EnhancedQuizSolver:
         return answer, submit_url, next_url, submit_resp
 
     # ------------------------------------------------------------------
-    # Orchestrator
+    # Public orchestrator
     # ------------------------------------------------------------------
     def solve_and_submit(self, url: str, time_budget_sec: int = 180) -> Dict[str, Any]:
         start = time.time()
@@ -810,7 +791,7 @@ class EnhancedQuizSolver:
             "first": None,
             "submissions": [],
             "completed": False,
-            "total_time": 0,
+            "total_time": 0.0,
         }
 
         with sync_playwright() as p:
@@ -850,10 +831,9 @@ class EnhancedQuizSolver:
                 "submit_response": resp,
             }
 
-            # Chain
+            # Follow chain
             steps = 0
             max_steps = 50
-
             while nxt and steps < max_steps:
                 elapsed = time.time() - start
                 if elapsed > time_budget_sec - 15:
@@ -882,7 +862,6 @@ class EnhancedQuizSolver:
                         "submit_response": resp2,
                     }
                 )
-
                 nxt = nxt2
 
             browser.close()
@@ -893,13 +872,16 @@ class EnhancedQuizSolver:
         return result
 
 
-# Example standalone usage (not needed in Railway/FastAPI)
+# Alias for backward compatibility with app.py
+QuizSolver = EnhancedQuizSolver
+
+
 if __name__ == "__main__":
     EMAIL = os.getenv("QUIZ_EMAIL", "your-email@example.com")
     SECRET = os.getenv("QUIZ_SECRET", "your-secret")
-    START_URL = os.getenv("QUIZ_URL", "https://tds-llm-analysis.s-anand.net/demo")
+    START_URL = os.getenv("QUIZ_URL", "https://quiz.example.com/start")
 
-    solver = EnhancedQuizSolver(email=EMAIL, secret=SECRET)
+    solver = QuizSolver(email=EMAIL, secret=SECRET)
     result = solver.solve_and_submit(START_URL)
 
     print("\n" + "=" * 60)
