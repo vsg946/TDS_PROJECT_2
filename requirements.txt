@@ -16,3 +16,6 @@ pydub
 SpeechRecognition
 openai
 playwright
+
+
+ffmpeg
