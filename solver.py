@@ -14,7 +14,6 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 from playwright.sync_api import sync_playwright, Page
 
-# AI Pipe token – set this as an env var in Railway
 AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
 
 
@@ -32,7 +31,6 @@ class QuizSolver:
     # HTML / URL helpers
     # -----------------------------------------------------
     def _find_submit_url(self, html: str, page_url: str) -> Optional[str]:
-        """Find the /submit URL."""
         m = re.search(r"https?://[^\s\"'<>]+/submit", html)
         if m:
             return m.group(0)
@@ -52,7 +50,6 @@ class QuizSolver:
             return None
 
     def _extract_atob_chunks(self, html: str) -> List[str]:
-        """Find atob("...") payloads and decode them."""
         chunks = []
         pattern = r'atob\(\s*[`"\']([^`"\']+)[`"\']\s*\)'
         for m in re.finditer(pattern, html):
@@ -64,10 +61,9 @@ class QuizSolver:
         return chunks
 
     # -----------------------------------------------------
-    # File download + processing
+    # Download + file processing
     # -----------------------------------------------------
     def _download_file(self, href: str, base_url: str) -> Optional[Tuple[str, bytes, str]]:
-        """Download a file and return (path, bytes, type)."""
         if not href:
             return None
         if not href.lower().startswith("http"):
@@ -104,7 +100,6 @@ class QuizSolver:
             ext = "." + href.split(".")[-1].split("?")[0]
             ftype = "audio"
         else:
-            # unknown – still save with whatever extension is there
             name = href.split("/")[-1]
             if "." in name:
                 ext = "." + name.split(".")[-1].split("?")[0]
@@ -115,7 +110,6 @@ class QuizSolver:
         return tmp.name, content, ftype
 
     def _process_pdf_sum(self, path: str) -> Optional[float]:
-        """Sum 'value'-like column in PDF tables."""
         self._debug("Processing PDF:", path)
         try:
             with pdfplumber.open(path) as pdf:
@@ -149,7 +143,6 @@ class QuizSolver:
         return None
 
     def _process_csv_xlsx_sum(self, path: str) -> Optional[float]:
-        """Sum value-like column in CSV/XLSX."""
         self._debug("Processing CSV/XLSX:", path)
         try:
             if path.endswith(".csv"):
@@ -172,7 +165,6 @@ class QuizSolver:
         return None
 
     def _process_json_answer(self, path: str) -> Optional[Any]:
-        """Extract answer from JSON if possible."""
         self._debug("Processing JSON:", path)
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -188,10 +180,9 @@ class QuizSolver:
         return None
 
     # -----------------------------------------------------
-    # Audio via AI Pipe LLM
+    # Audio via AI Pipe – transcription only
     # -----------------------------------------------------
     def _llm_transcribe_audio(self, audio_bytes: bytes, ext: str) -> Optional[str]:
-        """Send audio bytes to AIPipe + GPT-4.1-nano to get transcript."""
         if not AIPIPE_TOKEN:
             self._debug("No AIPIPE_TOKEN, skipping online transcription")
             return None
@@ -214,9 +205,8 @@ class QuizSolver:
                         {
                             "type": "text",
                             "text": (
-                                "You are an accurate transcription engine. "
-                                "Transcribe the following audio exactly. "
-                                "Return ONLY the transcript text, nothing else."
+                                "You are an accurate speech-to-text system. "
+                                "Transcribe the audio exactly. Return ONLY the text."
                             ),
                         },
                         {
@@ -237,120 +227,113 @@ class QuizSolver:
             self._debug("AIPipe transcription error:", e)
             return None
 
-    def _parse_direct_number_from_text(self, text: str) -> Optional[float]:
-        """Pull a direct numeric answer from transcript, if stated."""
-        low = text.lower()
-        patterns = [
-            r"(?:secret\s*code|code|cutoff|value|number)\s*(?:is|=|:)?\s*(\d+)",
-            r"(?:answer|final\s*answer)\s*(?:is|=|:)?\s*(\d+)",
-        ]
-        for pat in patterns:
-            m = re.search(pat, low)
-            if m:
-                try:
-                    return float(m.group(1))
-                except Exception:
-                    pass
-
-        nums = re.findall(r"\d+\.?\d*", low)
-        if nums:
+    # -----------------------------------------------------
+    # Audio instruction handling
+    # -----------------------------------------------------
+    def _parse_cutoff_from_text(self, text: str) -> Optional[float]:
+        """Find 'Cutoff: 26779' style value from page text or transcript."""
+        m = re.search(r"cutoff[^0-9]*([\d]+(\.\d+)?)", text.lower())
+        if m:
             try:
-                return float(nums[-1])
+                return float(m.group(1))
             except Exception:
-                pass
+                return None
         return None
 
     def _execute_audio_instructions(
-        self, transcript: str, page: Page, url: str
+        self,
+        transcript: str,
+        page_text: str,
+        url: str,
+        csv_or_xlsx_path: Optional[str],
     ) -> Optional[float]:
         """
-        When audio describes: 'download the CSV / Excel / PDF / JSON and
-        sum/average/...', follow those instructions.
+        Handle instructions like:
+        'Download the CSV on this page and sum the FIRST COLUMN for rows where
+         the cutoff is GREATER THAN the cutoff value shown on the page.'
         """
         if not transcript:
             return None
 
-        t = transcript.lower()
         self._debug("Audio transcript:", transcript)
 
-        # operation
-        op = "sum"
-        if any(k in t for k in ["average", "mean"]):
-            op = "avg"
-        elif any(k in t for k in ["max", "highest", "largest"]):
-            op = "max"
-        elif any(k in t for k in ["min", "lowest", "smallest"]):
-            op = "min"
-        elif any(k in t for k in ["count", "number of"]):
-            op = "count"
-
-        # file type
-        ftype = None
-        ext = None
-        if "csv" in t:
-            ftype, ext = "csv", ".csv"
-        elif any(k in t for k in ["excel", "xlsx", "spreadsheet"]):
-            ftype, ext = "xlsx", ".xlsx"
-        elif "pdf" in t:
-            ftype, ext = "pdf", ".pdf"
-        elif "json" in t:
-            ftype, ext = "json", ".json"
-
-        if not ext:
-            return None
-
-        html = page.content()
-        soup = BeautifulSoup(html, "html.parser")
-
-        target_href = None
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if href.lower().endswith(ext):
-                target_href = href
-                break
-
-        if not target_href:
-            return None
-
-        dl = self._download_file(target_href, url)
-        if not dl:
-            return None
-        path, _bytes, dtype = dl
-
-        # Process the file according to dtype & op
-        if dtype in ("csv", "xlsx"):
+        # Step 1: If it literally says 'answer is 12345', use that.
+        direct_nums = re.findall(r"\d+\.?\d*", transcript)
+        if ("answer" in transcript.lower() or "final answer" in transcript.lower()) and direct_nums:
             try:
-                if dtype == "csv":
-                    df = pd.read_csv(path)
+                return float(direct_nums[-1])
+            except Exception:
+                pass
+
+        # Step 2: detect if it talks about CSV/Excel and cutoff logic
+        t_low = transcript.lower()
+        page_low = page_text.lower()
+
+        wants_csv = "csv" in t_low or "spreadsheet" in t_low or "table" in t_low
+        mentions_column1 = "column 1" in t_low or "first column" in t_low
+        mentions_cutoff = "cutoff" in t_low or "cut-off" in t_low
+
+        cutoff_value = self._parse_cutoff_from_text(page_low) or self._parse_cutoff_from_text(t_low)
+
+        if wants_csv and csv_or_xlsx_path:
+            # Load CSV/XLSX
+            try:
+                if csv_or_xlsx_path.endswith(".csv"):
+                    df = pd.read_csv(csv_or_xlsx_path, nrows=50000)
                 else:
-                    df = pd.read_excel(path)
+                    df = pd.read_excel(csv_or_xlsx_path, nrows=50000)
             except Exception as e:
                 self._debug("Audio CSV/XLSX read error:", e)
                 return None
 
-            nums = df.select_dtypes(include=["number"])
-            if nums.empty:
-                return None
-            col = nums.columns[0]
-            series = nums[col].dropna()
+            cols = list(df.columns)
+            cols_lower = [str(c).lower().strip() for c in cols]
 
-            if op == "sum":
-                return float(series.sum())
-            if op == "avg":
-                return float(series.mean())
-            if op == "max":
-                return float(series.max())
-            if op == "min":
-                return float(series.min())
-            if op == "count":
-                return float(series.count())
+            # Which column to sum?
+            sum_col_idx = 0  # default first column
+            if mentions_column1:
+                sum_col_idx = 0
+            else:
+                # Prefer a column named 'value' / 'amount'
+                for i, name in enumerate(cols_lower):
+                    if name in ("value", "amount", "total", "sum"):
+                        sum_col_idx = i
+                        break
 
-        elif dtype == "pdf":
-            return self._process_pdf_sum(path)
-        elif dtype == "json":
-            val = self._process_json_answer(path)
-            if isinstance(val, (int, float)):
-                return float(val)
+            # Build condition
+            mask = pd.Series(True, index=df.index)
+
+            if mentions_cutoff and cutoff_value is not None:
+                # look for cutoff column
+                cutoff_col_idx = None
+                for i, name in enumerate(cols_lower):
+                    if "cutoff" in name or "cut-off" in name:
+                        cutoff_col_idx = i
+                        break
+
+                if cutoff_col_idx is not None:
+                    cutoff_series = pd.to_numeric(df.iloc[:, cutoff_col_idx], errors="coerce")
+                    # Try to guess inequality from text
+                    if any(k in t_low for k in ["greater than or equal", "at least", "≥", "=>"]):
+                        mask &= cutoff_series >= cutoff_value
+                    elif any(k in t_low for k in ["less than", "below", "<"]):
+                        mask &= cutoff_series < cutoff_value
+                    else:
+                        # default "greater than"
+                        mask &= cutoff_series > cutoff_value
+
+            # Now sum the chosen column with mask
+            sum_series = pd.to_numeric(df.iloc[:, sum_col_idx], errors="coerce")
+            sum_value = float(sum_series[mask].sum())
+            self._debug("Audio CSV computed sum:", sum_value)
+            return sum_value
+
+        # If nothing special detected, just fall back to last number in transcript
+        if direct_nums:
+            try:
+                return float(direct_nums[-1])
+            except Exception:
+                pass
 
         return None
 
@@ -358,7 +341,6 @@ class QuizSolver:
     # Answer from HTML directly
     # -----------------------------------------------------
     def _extract_answer_from_page(self, page: Page, html: str) -> Optional[Any]:
-        """Use JS variables / data-answer attributes / regex."""
         try:
             ans = page.evaluate(
                 """
@@ -415,14 +397,15 @@ class QuizSolver:
 
         html = page.content()
         soup = BeautifulSoup(html, "html.parser")
-        text = soup.get_text(separator="\n", strip=True)
+        page_text = soup.get_text(separator="\n", strip=True)
 
         submit_url = self._find_submit_url(html, url)
         atob_chunks = self._extract_atob_chunks(html)
 
-        # Detect audio + one main data file
+        # Detect one audio file and one data file on the page
         audio_bytes = None
         audio_ext = ".mp3"
+        csv_or_xlsx_path = None
         data_file_path = None
         data_file_type = None
 
@@ -430,6 +413,7 @@ class QuizSolver:
             href = a["href"]
             lower = href.lower()
 
+            # audio
             if (audio_bytes is None) and any(
                 lower.endswith(x) for x in (".mp3", ".wav", ".ogg", ".m4a", ".flac")
             ):
@@ -440,30 +424,33 @@ class QuizSolver:
                         audio_bytes = content
                         audio_ext = os.path.splitext(path)[1] or ".mp3"
 
+            # csv/xlsx/json/pdf
             if (data_file_path is None) and any(
                 lower.endswith(x) for x in (".pdf", ".csv", ".xlsx", ".json")
             ):
                 dl = self._download_file(href, url)
                 if dl:
                     data_file_path, _bytes, data_file_type = dl
+                    if data_file_type in ("csv", "xlsx"):
+                        csv_or_xlsx_path = data_file_path
 
+        # ---------------- Answer determination ----------------
         answer: Any = None
 
-        # 1) Audio-based instructions, if any
+        # 1) Audio instructions (like "sum column 1 where cutoff > ...")
         if audio_bytes is not None:
             transcript = self._llm_transcribe_audio(audio_bytes, audio_ext)
             if transcript:
-                num = self._parse_direct_number_from_text(transcript)
-                if num is not None:
-                    answer = num
-                else:
-                    answer = self._execute_audio_instructions(transcript, page, url)
+                # First try detailed instruction handler
+                answer = self._execute_audio_instructions(
+                    transcript, page_text, url, csv_or_xlsx_path
+                )
 
-        # 2) Direct from page
+        # 2) Direct from page (JS / DOM)
         if answer is None:
             answer = self._extract_answer_from_page(page, html)
 
-        # 3) atob JSON with answer
+        # 3) atob JSON with "answer"
         if answer is None:
             for chunk in atob_chunks:
                 try:
@@ -474,7 +461,7 @@ class QuizSolver:
                 except Exception:
                     pass
 
-        # 4) Data file numeric
+        # 4) Data file simple sums (for non-audio questions)
         if answer is None and data_file_path and data_file_type:
             if data_file_type == "pdf":
                 answer = self._process_pdf_sum(data_file_path)
@@ -483,9 +470,9 @@ class QuizSolver:
             elif data_file_type == "json":
                 answer = self._process_json_answer(data_file_path)
 
-        # 5) fallback – last number in visible text
+        # 5) fallback: last number on page
         if answer is None:
-            nums = re.findall(r"\d+\.?\d*", text)
+            nums = re.findall(r"\d+\.?\d*", page_text)
             if nums:
                 try:
                     answer = float(nums[-1])
@@ -497,7 +484,7 @@ class QuizSolver:
 
         self._debug("ANSWER:", answer)
 
-        # Submit the answer
+        # ---------------- Submit ----------------
         submit_response: Dict[str, Any] = {"error": "no-submit-url"}
         next_url: Optional[str] = None
 
@@ -509,6 +496,7 @@ class QuizSolver:
                 "answer": answer,
             }
             self._debug("Submitting to:", submit_url, "payload:", payload)
+
             try:
                 r = self.session.post(submit_url, json=payload, timeout=25)
                 try:
@@ -523,7 +511,7 @@ class QuizSolver:
         return answer, submit_url, next_url, submit_response
 
     # -----------------------------------------------------
-    # Public orchestrator
+    # Orchestrator
     # -----------------------------------------------------
     def solve_and_submit(self, url: str, time_budget_sec: int = 170) -> Dict[str, Any]:
         start = time.time()
@@ -549,7 +537,7 @@ class QuizSolver:
             page = browser.new_page()
             page.set_default_timeout(30000)
 
-            # First quiz URL
+            # first page
             elapsed = time.time() - start
             ans, s_url, nxt, resp = self._solve_one_page(
                 page, url, time_budget_sec - elapsed
@@ -561,16 +549,16 @@ class QuizSolver:
                 "submit_response": resp,
             }
 
-            # Follow chain of URLs
-            iterations = 0
-            while nxt and iterations < 40:
+            # follow chain
+            steps = 0
+            while nxt and steps < 40:
                 elapsed = time.time() - start
                 if elapsed > 165:
                     self._debug("Global time limit reached")
                     break
 
-                iterations += 1
-                self._debug(f"--- Chain step {iterations}: {nxt} ---")
+                steps += 1
+                self._debug(f"--- Chain step {steps}: {nxt} ---")
                 ans2, s_url2, nxt2, resp2 = self._solve_one_page(
                     page, nxt, time_budget_sec - elapsed
                 )
